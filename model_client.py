@@ -3,8 +3,13 @@ nothing else in the rig changes. The whole rig calls `model_complete()` (the loo
 `summarize()` (Step 2).
 
 PROVIDERS (set MODEL_PROVIDER):
-  - "openai"   (default)  -> OpenAI chat-completions. Your key. Unchanged.
-  - "genaihub"            -> SAP GenAI Hub via the BTP `aicore` destination. Cost = SAP's, not yours.
+  - "anthropic" (DEFAULT here) -> Claude (Sonnet) on SAP GenAI Hub, native Messages API. Cost = SAP's.
+  - "genaihub"                 -> SAP GenAI Hub via the BTP `aicore` destination. Cost = SAP's, not yours.
+  - "openai"                   -> OpenAI chat-completions. YOUR key (opt-in only). Avoid in D2M_MultiAgent.
+
+D2M_MultiAgent runs on BTP / AI Core ONLY -- no out-of-pocket OpenAI spend. The default is "anthropic"
+so a naked `python web.py` can never silently fall back to OpenAI. (NOTE: mcp_server/vector.py and
+learning.py still import openai directly for embeddings/reflection -- see STARTING_POINT.md task #1.)
 
 Both return the SAME object shape the rig depends on: a message with `.content` and `.tool_calls`,
 where each tool_call has `.id` and `.function.{name,arguments}`. (agent.py reads exactly that.)
@@ -23,7 +28,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-MODEL_PROVIDER = os.getenv("MODEL_PROVIDER", "openai").lower()
+MODEL_PROVIDER = os.getenv("MODEL_PROVIDER", "anthropic").lower()   # AI Core only; "openai" is opt-in
 
 # Logical model names (unchanged — the openai path uses these directly).
 MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")          # the main loop (cheap, tool-calling)

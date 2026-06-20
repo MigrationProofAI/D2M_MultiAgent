@@ -4,6 +4,64 @@
 > This project's one job: take the single-agent rig to **multi-agent** and close the initial architecture.
 > Start a fresh chat here. Read this file + the three diagrams first.
 
+## What we want to achieve (north star)
+Turn the single-agent rig into a **multi-agent system**: a team of **bounded agents** — each owning one
+domain (material, BOM, routing, planning, costing, pricing, rendering, grounding…) — **composed by a
+Conductor** using the four orchestration shapes (sequential / parallel / loop / hybrid). The architecture
+must behave like a **blueprint**: adding the Nth agent is a **mechanical, low-risk** act, not a redesign.
+We add **orchestration + agents on top**; we do **not** rewrite the foundation. Everything runs on **SAP
+BTP / AI Core** — zero out-of-pocket model spend.
+
+## Non-negotiable constraints
+1. **AI Core / BTP only — no OpenAI keys, no money out of pocket.**
+   - The brains (main loop, genesis/vision, summaries) go through the model seam (`model_complete`). With
+     `MODEL_PROVIDER=anthropic` they run **Claude Sonnet on AI Core**. ✅
+   - The provider **default was flipped** `openai → anthropic` in `model_client.py` (this project only), so a
+     naked `python web.py` can **never** silently bill OpenAI. `run_rig.ps1` already forces `anthropic`.
+   - **Two real leaks remain (TASK #1 — small, contained, do it first):**
+     - `mcp_server/vector.py` — `OpenAI()` at module load + `text-embedding-3-small`. This is the **live**
+       one (semantic material search). Fix: point embeddings at an **AI Core embedding deployment** (GenAI
+       Hub has them) **or** a local embedder (`sentence-transformers`). No OpenAI key either way.
+     - `learning.py` — reflection (`gpt-4o-mini`) + embeddings via OpenAI. **Flag-gated OFF** (`D2M_LEARNING=0`)
+       so no charge today, but route it through the seam **before** enabling it.
+   - **Rule for every new agent:** call the model **only** via `model_complete` (the seam); **never**
+     `import openai` directly.
+2. **Don't change the foundation.** `run_turn`, the `mcp_server/*` data layer, the `model_client` seam,
+   `memory.py`, `session.py`, the SAP OData/RFC contracts — **reuse, never rewrite.** These are live-verified.
+3. **Small, reversible increments.** New module + feature flag + golden-path test per step. The baseline
+   commit is the diff anchor. **Never break the running copy.** (Full discipline in “Change-small-and-test”.)
+
+## How to add an agent (the repeatable recipe)
+An agent is fully specified by **four things** — fill them in and it slots into the Conductor:
+1. **Authority** — what it may *change* (a doer), or *read + veto* (a reviewer). Exactly one domain.
+2. **Skill (`skills/<agent>/SKILL.md`)** — its charter: `when_to_trigger`, the operating procedure, and the
+   **explicit list of tools it is allowed to bind**.
+3. **Bound tools / MCP** — the **least-privilege subset** of already-vetted callables (`tools.py` /
+   `mcp_server`). Add new data-layer code *only* if the capability genuinely doesn't exist yet.
+4. **Orchestration role** — where the Conductor places it: a stage in the sequence, a voice in the parallel
+   board, or a generator/critic in a loop.
+
+**Steps:** (a) write the `SKILL.md` declaring authority + allowed tools; (b) register the agent =
+`subagent(system=SKILL, tools=allowed_subset)`; (c) add it to the Conductor's plan (one line); (d) add a
+**golden-path test + a deny-test** (proves it can't exceed its authority); (e) flip its flag on. **No
+foundation touched.** That's the whole point — the 8th agent costs the same as the 3rd.
+
+## Agent catalog & roadmap (the architecture already implies these)
+The diagrams show a subset. The same `Agent ⊃ Skill ⊃ Tools/MCP` pattern absorbs everything we already have
+plus what's coming:
+- **Live doer capabilities → agents:** Material · BOM · Routing · Planning · Costing.
+- **Already built, not yet drawn as agents:**
+  - **PIR / Procurement** — genesis already wraps the purchase-info-record → a Procurement agent.
+  - **Cost price** — the cost estimate exists → the Costing agent.
+  - **Render** — the `d2m-render` skill + `render_card` → a **Render agent** (results → structured-data
+    cards). This is the “render half” from our earlier discussion.
+  - **Grounding** — `codebook-consult` / `codebook-grounding` skills → a Grounding agent (validates field
+    values before any write).
+- **Future:** **Sales-price agent** (pricing condition records), an **MD04 reader** (`read_mrp_list` against
+  `API_MRP_MATERIALS_SRV` — the truthful “data half” for the MD04 card), and onward.
+
+Adding any of these is the **four-step recipe above** — never a redesign.
+
 ## The blueprint (already in this folder)
 - `architecture.svg` — **where we are**: a single hand-rolled agentic loop (`run_turn`) + a binary router. Not multi-agent.
 - `target_architecture.svg` — **where we're going**: `Agent ⊃ Skill ⊃ Tools/MCP`, each agent with an **authority boundary**. A Conductor orchestrates; doer agents write within their domain; review agents read + veto; the human gate sits only at the Conductor.
@@ -56,13 +114,17 @@ The proven data layer (`mcp_server/sap.py`, `make.py`, `genesis.py`, `planning_c
 
 ## First concrete step for the new chat
 1. Confirm the baseline runs: `run_rig.ps1` (conda base — has pyrfc; `MODEL_PROVIDER=anthropic`, dedup off).
-2. Capture the golden-path fixtures (above).
-3. Write `orchestrator.py` with `subagent()` + `board_parallel()`, behind `RIG_ORCHESTRATE`.
-4. Smoke-test: the parallel board yields an equivalent synthesized review. Diff vs. the in-model board.
-5. Commit. Then Phase 2.
+2. **Task #1 — cut the OpenAI cord:** repoint `mcp_server/vector.py` embeddings to an AI Core embedding
+   deployment (or a local `sentence-transformers` model); confirm nothing on the hot path `import openai`.
+   Keep `learning.py` off until it's seam-routed too. (Small, contained — do before orchestration.)
+3. Capture the golden-path fixtures (above).
+4. Write `orchestrator.py` with `subagent()` + `board_parallel()`, behind `RIG_ORCHESTRATE`.
+5. Smoke-test: the parallel board yields an equivalent synthesized review. Diff vs. the in-model board.
+6. Commit. Then Phase 2.
 
 ## Run / environment notes (inherited)
 - Run from **conda base** (has `pyrfc`) for RFC features — `uv run`/`.venv` lacks pyrfc and silently degrades grounding/config-graph/B6/codebook.
 - `.venv` was **not** copied — recreate it (`uv sync`) if you use the venv path, but prefer conda base for full features.
 - `.env` and `env.txt` **were copied** (real secrets, same machine). They're gitignored — keep them out of any zip/handoff. Keep `Design2Make_R00763` (the UI source) private.
 - The built UI bundle is in `static_v2/`; its source lives in the sibling `Design2Make_R00763/frontend` (rebuild there → copy to `static_v2/`).
+- **Model provider:** default is now `anthropic` (Claude Sonnet on AI Core). `genaihub` (gpt-4o on AI Core) is the alternative; `openai` is opt-in only and to be avoided — it spends your own key. No new agent should `import openai`; always go through `model_complete`.

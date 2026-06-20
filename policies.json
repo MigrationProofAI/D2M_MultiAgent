@@ -1,0 +1,45 @@
+{
+  "_comment": "Org assurance POLICY as DATA -- the standard the board judges against. Customer artifact (clean core, not in SAP). assurance.py reads this; the deterministic checks run it over the real objects to produce FINDINGS. Edit values here, no code change. policies.md is the human rationale.",
+  "country_of_origin": {
+    "required": true,
+    "restricted_regions": ["RU", "BY", "IR", "KP", "SY", "CU"],
+    "elevated_review_regions": ["CN", "HK"],
+    "missing_severity": "error",
+    "restricted_severity": "error",
+    "elevated_severity": "warning"
+  },
+  "sourcing": {
+    "max_single_vendor_share": 0.6,
+    "single_vendor_review_count": 5,
+    "share_severity": "warning",
+    "missing_pir_severity": "error"
+  },
+  "master_data": {
+    "required_all": ["ProductType", "BaseUnit", "ProductGroup"],
+    "required_fert": ["CountryOfOrigin"],
+    "missing_severity": "error"
+  },
+  "plant_extension": {
+    "_comment": "Promoted from the recurring correction 'first extend the materials'. Every BOM component must be extended to the assembly's plant or it can't be added to the plant BOM / procured / produced there.",
+    "required": true,
+    "missing_severity": "error"
+  },
+  "weights": {
+    "net_le_gross_severity": "warning",
+    "nonnegative_severity": "error",
+    "same_unit_severity": "error"
+  },
+  "status": {
+    "fert_design_status_code": "01",
+    "fert_in_design_severity": "warning"
+  },
+  "cost": {
+    "max_unit_cost": null,
+    "zero_cost_bought_severity": "warning"
+  },
+  "coded_grounding": {
+    "_comment": "B1: before a create/extend write, coded fields must be grounded in the codebook and plant-specific values valid for the plant (config-graph). enforce=true blocks the write; severity 'error' = block, 'warning' = advise in the preview.",
+    "enforce": true,
+    "severity": "error"
+  }
+}

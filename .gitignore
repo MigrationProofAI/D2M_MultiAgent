@@ -1,0 +1,29 @@
+adk_sessions.db
+*.db-journal
+genesis_ledger.json
+kg_instances.json
+frontend/node_modules/
+frontend/dist/
+tts_cache/
+
+# secrets -- NEVER commit
+.env
+.env.*
+env.txt
+*.pem
+*.crt
+
+# build artifacts / regenerable data
+vector_store/
+__pycache__/
+*.pyc
+
+# rig runtime: session folders (trace/assets/summary/archive) + venv
+sessions/
+.venv/
+
+# learning loop (runtime data)
+lessons.jsonl
+promotions.jsonl
+learning_ledger.jsonl
+logs/learning_events.jsonl

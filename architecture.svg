@@ -1,0 +1,119 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1180" viewBox="0 0 1600 1180">
+<defs><marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#7a8893"/></marker></defs>
+<rect x="0" y="0" width="1600" height="1180" rx="0" fill="#fbfaf7" stroke="#fbfaf7" stroke-width="1.6"/>
+<text x="40" y="38" font-family="Segoe UI, Arial, sans-serif" font-size="24" font-weight="800" fill="#1c2a33" text-anchor="start">D2M Test Rig — Current Architecture</text>
+<text x="40" y="60" font-family="Segoe UI, Arial, sans-serif" font-size="13" font-weight="normal" fill="#6a7882" text-anchor="start">ADK-free clean room: a hand-rolled, single-loop agentic system that grew into a self-extending platform   ·   2026-06</text>
+<rect x="40" y="84" width="1520" height="92" rx="9" fill="#e7eff7" stroke="#2f5d8a" stroke-width="1.6"/>
+<text x="54" y="106" font-family="Segoe UI, Arial, sans-serif" font-size="13.5" font-weight="700" fill="#2f5d8a" text-anchor="start">①  UI  —  React SPA (served from static_v2)</text>
+<text x="54" y="128" font-family="Segoe UI, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#3c4a54" text-anchor="start">Conversation: chat · GFM tables (remark-gfm)        |        Agent Activity: live tool trace        |        Structured Data: typed cards + render_card</text>
+<text x="54" y="145" font-family="Segoe UI, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#3c4a54" text-anchor="start">source-of-truth: Design2Make_R00763/frontend  →  vite build  →  static_v2     ·     transport: WebSocket /ws/{sid}  +  REST /api/sessions</text>
+<rect x="40" y="196" width="1520" height="78" rx="9" fill="#e7eff7" stroke="#2f5d8a" stroke-width="1.6"/>
+<text x="54" y="218" font-family="Segoe UI, Arial, sans-serif" font-size="13.5" font-weight="700" fill="#2f5d8a" text-anchor="start">②  web.py  —  FastAPI server  ·  WebSocket  ·  REST</text>
+<text x="54" y="240" font-family="Segoe UI, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#3c4a54" text-anchor="start">intent router (binary):  is_genesis(text,image)?  →  GENESIS persona   :   CHAT persona</text>
+<text x="54" y="257" font-family="Segoe UI, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#3c4a54" text-anchor="start">per turn:  inject skill INDEX  ·  recall+inject LESSONS (MVLL)  ·  set_current_session()  ·  stream answer + trace + @@DATA@@ cards</text>
+<rect x="40" y="294" width="980" height="116" rx="9" fill="#e7eff7" stroke="#2f5d8a" stroke-width="1.6"/>
+<text x="54" y="316" font-family="Segoe UI, Arial, sans-serif" font-size="14" font-weight="700" fill="#2f5d8a" text-anchor="start">③  agent.py  —  THE AGENT  ·  single hand-rolled agentic loop</text>
+<text x="54" y="338" font-family="Segoe UI, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#3c4a54" text-anchor="start">run_turn:   model_complete()  →  tool_calls?  →  dispatch()  →  repeat</text>
+<text x="54" y="355" font-family="Segoe UI, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#3c4a54" text-anchor="start">guards:   max_steps (RIG_MAX_STEPS)   ·   loop-breaker WITH TEETH (advise → hard-stop)</text>
+<text x="54" y="372" font-family="Segoe UI, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#3c4a54" text-anchor="start">ONE model, tool-calling.  NOT a multi-agent graph (yet).</text>
+<rect x="1040" y="294" width="520" height="54" rx="9" fill="#fbf7ee" stroke="#c8a96a" stroke-width="1.6"/>
+<text x="1054" y="316" font-family="Segoe UI, Arial, sans-serif" font-size="12" font-weight="700" fill="#c8a96a" text-anchor="start">deterministic orchestration</text>
+<text x="1054" y="338" font-family="Segoe UI, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#3c4a54" text-anchor="start">run_genesis = SEQUENTIAL pipeline:</text>
+<text x="1054" y="355" font-family="Segoe UI, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#3c4a54" text-anchor="start">materials → PIR/cost → BOM → routing → prod-version</text>
+<rect x="1040" y="356" width="520" height="54" rx="9" fill="#fbf7ee" stroke="#c8a96a" stroke-width="1.6"/>
+<text x="1054" y="378" font-family="Segoe UI, Arial, sans-serif" font-size="12" font-weight="700" fill="#c8a96a" text-anchor="start">in-model personas (not separate agents)</text>
+<text x="1054" y="400" font-family="Segoe UI, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#3c4a54" text-anchor="start">board review = ONE model, many roles:</text>
+<text x="1054" y="417" font-family="Segoe UI, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#3c4a54" text-anchor="start">engineering · compliance · finance · procurement</text>
+<text x="40" y="446" font-family="Segoe UI, Arial, sans-serif" font-size="13" font-weight="700" fill="#3a7a3f" text-anchor="start">the agent&#x27;s cross-cutting capabilities  —  the platform layer</text>
+<rect x="40" y="458" width="367" height="96" rx="9" fill="#eaf3ea" stroke="#3a7a3f" stroke-width="1.6"/>
+<text x="54" y="480" font-family="Segoe UI, Arial, sans-serif" font-size="13.5" font-weight="700" fill="#3a7a3f" text-anchor="start">Model Seam — model_client.py</text>
+<text x="54" y="502" font-family="Segoe UI, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#3c4a54" text-anchor="start">OpenAI  ·  GenAI-Hub (gpt-4o)</text>
+<text x="54" y="519" font-family="Segoe UI, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#3c4a54" text-anchor="start">Anthropic — Sonnet 4.6 via /invoke</text>
+<text x="54" y="536" font-family="Segoe UI, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#3c4a54" text-anchor="start">→ one swap point, agent unchanged</text>
+<rect x="425" y="458" width="367" height="96" rx="9" fill="#eaf3ea" stroke="#3a7a3f" stroke-width="1.6"/>
+<text x="439" y="480" font-family="Segoe UI, Arial, sans-serif" font-size="13.5" font-weight="700" fill="#3a7a3f" text-anchor="start">Memory — TieredMemory</text>
+<text x="439" y="502" font-family="Segoe UI, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#3c4a54" text-anchor="start">working · summary · archive</text>
+<text x="439" y="519" font-family="Segoe UI, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#3c4a54" text-anchor="start">token-budget compaction</text>
+<text x="439" y="536" font-family="Segoe UI, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#3c4a54" text-anchor="start">blob eviction → sessions/&lt;id&gt;/</text>
+<rect x="810" y="458" width="367" height="96" rx="9" fill="#fdf1df" stroke="#b9772a" stroke-width="1.6"/>
+<text x="824" y="480" font-family="Segoe UI, Arial, sans-serif" font-size="13.5" font-weight="700" fill="#b9772a" text-anchor="start">Skills — SkillRegistry   ★</text>
+<text x="824" y="502" font-family="Segoe UI, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#3c4a54" text-anchor="start">progressive disclosure: index/body/script</text>
+<text x="824" y="519" font-family="Segoe UI, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#3c4a54" text-anchor="start">DEMO→SKILL: write_skill_artifact →assets→</text>
+<text x="824" y="536" font-family="Segoe UI, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#3c4a54" text-anchor="start">promote_skill (HUMAN-GATE) → skills/ → render_card</text>
+<rect x="1195" y="458" width="367" height="96" rx="9" fill="#eaf3ea" stroke="#3a7a3f" stroke-width="1.6"/>
+<text x="1209" y="480" font-family="Segoe UI, Arial, sans-serif" font-size="13.5" font-weight="700" fill="#3a7a3f" text-anchor="start">Learning — MVLL</text>
+<text x="1209" y="502" font-family="Segoe UI, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#3c4a54" text-anchor="start">capture → recall → inject → promote</text>
+<text x="1209" y="519" font-family="Segoe UI, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#3c4a54" text-anchor="start">FAISS lesson index</text>
+<text x="1209" y="536" font-family="Segoe UI, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#3c4a54" text-anchor="start">human-gated promote-to-skill</text>
+<rect x="40" y="576" width="1520" height="86" rx="9" fill="#e7eff7" stroke="#2f5d8a" stroke-width="1.6"/>
+<text x="54" y="598" font-family="Segoe UI, Arial, sans-serif" font-size="13.5" font-weight="700" fill="#2f5d8a" text-anchor="start">④  tools.py  —  tool registry (~24)   ·   MCP-shaped callables (the JSON tool-spec IS the contract; no in-process MCP server)</text>
+<text x="54" y="620" font-family="Segoe UI, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#3c4a54" text-anchor="start"></text>
+<rect x="54" y="620" width="430.4" height="22" rx="11" fill="#f3f7fb" stroke="#2f5d8a" stroke-width="1.1"/>
+<text x="269.2" y="635" font-family="Segoe UI, Arial, sans-serif" font-size="10.8" font-weight="600" fill="#2a3640" text-anchor="middle">Master data: get/create/update · extend_to_plant · enable_plant_production</text>
+<rect x="494.4" y="620" width="161.6" height="22" rx="11" fill="#f3f7fb" stroke="#2f5d8a" stroke-width="1.1"/>
+<text x="575.1999999999999" y="635" font-family="Segoe UI, Arial, sans-serif" font-size="10.8" font-weight="600" fill="#2a3640" text-anchor="middle">Make: create_bom · routing</text>
+<rect x="666.0" y="620" width="128.0" height="22" rx="11" fill="#f3f7fb" stroke="#2f5d8a" stroke-width="1.1"/>
+<text x="730.0" y="635" font-family="Segoe UI, Arial, sans-serif" font-size="10.8" font-weight="600" fill="#2a3640" text-anchor="middle">Genesis: run_genesis</text>
+<rect x="804.0" y="620" width="200.79999999999998" height="22" rx="11" fill="#f3f7fb" stroke="#2f5d8a" stroke-width="1.1"/>
+<text x="904.4" y="635" font-family="Segoe UI, Arial, sans-serif" font-size="10.8" font-weight="600" fill="#2a3640" text-anchor="middle">Planning: create_demand · run_mrp</text>
+<rect x="1014.8" y="620" width="217.6" height="22" rx="11" fill="#f3f7fb" stroke="#2f5d8a" stroke-width="1.1"/>
+<text x="1123.6" y="635" font-family="Segoe UI, Arial, sans-serif" font-size="10.8" font-weight="600" fill="#2a3640" text-anchor="middle">Config-graph: storage-loc · MRP-ctrl</text>
+<rect x="1242.3999999999999" y="620" width="94.39999999999999" height="22" rx="11" fill="#f3f7fb" stroke="#2f5d8a" stroke-width="1.1"/>
+<text x="1289.6" y="635" font-family="Segoe UI, Arial, sans-serif" font-size="10.8" font-weight="600" fill="#2a3640" text-anchor="middle">Search: google</text>
+<rect x="54" y="648" width="374.4" height="22" rx="11" fill="#f3f7fb" stroke="#2f5d8a" stroke-width="1.1"/>
+<text x="241.2" y="663" font-family="Segoe UI, Arial, sans-serif" font-size="10.8" font-weight="600" fill="#2a3640" text-anchor="middle">Skill ops: load_skill · run_script · write/promote/render_card ★</text>
+<rect x="40" y="682" width="1520" height="70" rx="9" fill="#e7eff7" stroke="#2f5d8a" stroke-width="1.6"/>
+<text x="54" y="704" font-family="Segoe UI, Arial, sans-serif" font-size="13.5" font-weight="700" fill="#2f5d8a" text-anchor="start">⑤  mcp_server/  —  data layer (proven OData/RFC readers+writers, imported as plain callables)</text>
+<text x="54" y="726" font-family="Segoe UI, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#3c4a54" text-anchor="start">sap.py — OData over HTTPS (CSRF tokens)     ·     make.py / genesis.py     ·     planning_client.py — SSE bridge     ·     config_graph.py — OData     ·     btp_destination.py — BTP creds</text>
+<text x="40" y="792" font-family="Segoe UI, Arial, sans-serif" font-size="13" font-weight="700" fill="#5b4b91" text-anchor="start">external systems  &amp;  contracts</text>
+<rect x="40" y="804" width="367" height="92" rx="9" fill="#efe9f6" stroke="#5b4b91" stroke-width="1.6"/>
+<text x="54" y="826" font-family="Segoe UI, Arial, sans-serif" font-size="13.5" font-weight="700" fill="#5b4b91" text-anchor="start">SAP S/4HANA</text>
+<text x="54" y="848" font-family="Segoe UI, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#3c4a54" text-anchor="start">OData over HTTPS</text>
+<text x="54" y="865" font-family="Segoe UI, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#3c4a54" text-anchor="start">API_PRODUCT_SRV · BOM · MRP</text>
+<text x="54" y="882" font-family="Segoe UI, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#3c4a54" text-anchor="start">THE working contract</text>
+<rect x="425" y="804" width="367" height="92" rx="9" fill="#efe9f6" stroke="#5b4b91" stroke-width="1.6"/>
+<text x="439" y="826" font-family="Segoe UI, Arial, sans-serif" font-size="13.5" font-weight="700" fill="#5b4b91" text-anchor="start">NWRFC MCP servers</text>
+<text x="439" y="848" font-family="Segoe UI, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#3c4a54" text-anchor="start">:8001 planning (demand/MRP)</text>
+<text x="439" y="865" font-family="Segoe UI, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#3c4a54" text-anchor="start">:8002 production version</text>
+<text x="439" y="882" font-family="Segoe UI, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#3c4a54" text-anchor="start">SSE / MCP contract</text>
+<rect x="810" y="804" width="367" height="92" rx="9" fill="#efe9f6" stroke="#5b4b91" stroke-width="1.6"/>
+<text x="824" y="826" font-family="Segoe UI, Arial, sans-serif" font-size="13.5" font-weight="700" fill="#5b4b91" text-anchor="start">BTP GenAI Hub (AI Core)</text>
+<text x="824" y="848" font-family="Segoe UI, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#3c4a54" text-anchor="start">/invoke — Anthropic (Sonnet)</text>
+<text x="824" y="865" font-family="Segoe UI, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#3c4a54" text-anchor="start">/chat/completions — OpenAI</text>
+<text x="824" y="882" font-family="Segoe UI, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#3c4a54" text-anchor="start">via btp_destination</text>
+<rect x="1195" y="804" width="367" height="92" rx="9" fill="#f2f1ee" stroke="#9aa1a6" stroke-width="1.6" stroke-dasharray="6 4"/>
+<text x="1209" y="826" font-family="Segoe UI, Arial, sans-serif" font-size="13.5" font-weight="700" fill="#9aa1a6" text-anchor="start">Joule  →  SAP MCP servers</text>
+<text x="1209" y="848" font-family="Segoe UI, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#3c4a54" text-anchor="start">SAP&#x27;s own MCP servers</text>
+<text x="1209" y="865" font-family="Segoe UI, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#3c4a54" text-anchor="start">replaces the NWRFC stopgap</text>
+<text x="1209" y="882" font-family="Segoe UI, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#3c4a54" text-anchor="start">ROADMAP</text>
+<line x1="800.0" y1="176" x2="800.0" y2="196" stroke="#7a8893" stroke-width="1.7" marker-end="url(#ah)"/>
+<line x1="800.0" y1="274" x2="800.0" y2="294" stroke="#7a8893" stroke-width="1.7" marker-end="url(#ah)"/>
+<line x1="800.0" y1="662" x2="800.0" y2="682" stroke="#7a8893" stroke-width="1.7" marker-end="url(#ah)"/>
+<line x1="800.0" y1="410" x2="800.0" y2="458" stroke="#7a8893" stroke-width="1.7" marker-end="url(#ah)"/>
+<line x1="800.0" y1="554" x2="800.0" y2="576" stroke="#7a8893" stroke-width="1.7" marker-end="url(#ah)"/>
+<line x1="800.0" y1="752" x2="800.0" y2="804" stroke="#7a8893" stroke-width="1.7" marker-end="url(#ah)"/>
+<rect x="40" y="924" width="748" height="118" rx="9" fill="#fff" stroke="#c0563a" stroke-width="1.6"/>
+<text x="54" y="946" font-family="Segoe UI, Arial, sans-serif" font-size="13.5" font-weight="700" fill="#b14b32" text-anchor="start">Orchestration pattern — where we are</text>
+<text x="54" y="968" font-family="Segoe UI, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#3c4a54" text-anchor="start">TODAY:  ONE agentic loop  +  a BINARY intent router (genesis | chat).</text>
+<text x="54" y="985" font-family="Segoe UI, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#3c4a54" text-anchor="start">   · genesis = deterministic SEQUENTIAL pipeline      · board = in-model personas (1 model, many roles)</text>
+<text x="54" y="1002" font-family="Segoe UI, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#3c4a54" text-anchor="start">   →  NOT yet multi-agent.  No parallel fan-out, no agent-to-agent loops.</text>
+<text x="54" y="1019" font-family="Segoe UI, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#3c4a54" text-anchor="start">ROADMAP (hand-roll next):   router → parallel → loop → hybrid  multi-agent</text>
+<rect x="812" y="924" width="748" height="118" rx="9" fill="#eef3ee" stroke="#3a7a3f" stroke-width="1.6"/>
+<text x="826" y="946" font-family="Segoe UI, Arial, sans-serif" font-size="13.5" font-weight="700" fill="#3a7a3f" text-anchor="start">Evolution — vs the initial conceptualization</text>
+<text x="826" y="968" font-family="Segoe UI, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#3c4a54" text-anchor="start">FROM:  3-stage ADK agents + MCP-server framework  (a tool, then a framework).</text>
+<text x="826" y="985" font-family="Segoe UI, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#3c4a54" text-anchor="start">TO:  ADK-free, hand-rolled single loop  —  every failure is ours, hence fixable.</text>
+<text x="826" y="1002" font-family="Segoe UI, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#3c4a54" text-anchor="start">GREW:  a self-extension loop (demonstrate → author → human-gate → promote)  +  governance,</text>
+<text x="826" y="1019" font-family="Segoe UI, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#3c4a54" text-anchor="start">          memory, learning, a swappable model seam.   =  a PLATFORM, not a tool/framework.</text>
+<text x="40" y="1068" font-family="Segoe UI, Arial, sans-serif" font-size="12" font-weight="700" fill="#3c4a54" text-anchor="start">Legend:</text>
+<rect x="112" y="1054" width="18" height="14" rx="3" fill="#e7eff7" stroke="#2f5d8a" stroke-width="1.6"/>
+<text x="136" y="1066" font-family="Segoe UI, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#3c4a54" text-anchor="start">built / live</text>
+<rect x="232" y="1054" width="18" height="14" rx="3" fill="#eaf3ea" stroke="#3a7a3f" stroke-width="1.6"/>
+<text x="256" y="1066" font-family="Segoe UI, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#3c4a54" text-anchor="start">platform capability</text>
+<rect x="392" y="1054" width="18" height="14" rx="3" fill="#fdf1df" stroke="#b9772a" stroke-width="1.6"/>
+<text x="416" y="1066" font-family="Segoe UI, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#3c4a54" text-anchor="start">skills (new this session) ★</text>
+<rect x="606" y="1054" width="18" height="14" rx="3" fill="#efe9f6" stroke="#5b4b91" stroke-width="1.6"/>
+<text x="630" y="1066" font-family="Segoe UI, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#3c4a54" text-anchor="start">external system</text>
+<rect x="742" y="1054" width="18" height="14" rx="3" fill="#f2f1ee" stroke="#9aa1a6" stroke-width="1.6" stroke-dasharray="6 4"/>
+<text x="766" y="1066" font-family="Segoe UI, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#3c4a54" text-anchor="start">roadmap (not built)</text>
+<text x="40" y="1104" font-family="Segoe UI, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#6a7882" text-anchor="start">Human gates:  confirm=false→true (micro, per turn)   ·   promote_skill confirm=true (macro, cross-session)   ·   render-half works / data-half = next (vetted reader tools, e.g. API_MRP_MATERIALS_SRV)</text>
+</svg>

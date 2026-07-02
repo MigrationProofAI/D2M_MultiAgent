@@ -45,10 +45,32 @@ _CACHE: dict[tuple[str, str], list[dict]] = {}             # (relationship, plan
 
 
 def _read_relation(rel: str, plant: str) -> list[dict]:
-    """DISTINCT in-use values for a plant via OData (sap._sap_get -- the rig's working SAP path).
-    Raises on a transport/parse failure so get_relation can degrade + log (never crashes the caller)."""
-    import sap                                    # lazy: the OData-over-HTTPS seam (same as the writes)
+    """DISTINCT in-use values for a plant. SAP_VIA_MCP on -> the cloud mcp-config-graph (no in-process
+    OData); off -> sap._sap_get (the rig's working OData path). Raises on a transport/parse failure so
+    get_relation can degrade + log (never crashes the caller)."""
     r = _RELATIONS[rel]
+    # ---- cloud path: mcp-config-graph (same {values:[{code,text}]} shape this function returns) ----
+    try:
+        import mcp_route as _mr                   # lazy: same dir as sap on the rig's path
+        via = _mr.VIA_MCP
+    except Exception:
+        _mr, via = None, False
+    if via:
+        tool = "get_valid_storage_locations" if rel == "storage_location" else "get_valid_mrp_controllers"
+        txt = _mr.call("config", tool, {"plant": str(plant)})
+        try:
+            vals = json.loads(txt).get("values", [])
+        except Exception:
+            raise RuntimeError(txt)               # cloud error/non-JSON -> get_relation logs + degrades
+        out, seen = [], set()
+        for v in vals:
+            c = str(v.get("code") or "").strip()
+            if c and c not in seen:
+                seen.add(c)
+                out.append({"code": c, "text": v.get("text") or ""})
+        return sorted(out, key=lambda v: v["code"])
+    # ---- in-process OData (flag off) ----
+    import sap                                    # lazy: the OData-over-HTTPS seam (same as the writes)
     raw = sap._sap_get(r["path"], {"$filter": f"Plant eq '{plant}'", "$select": r["code"], "$top": _READ_TOP})
     if not isinstance(raw, str) or raw.startswith("SAP request failed"):
         raise RuntimeError(raw if isinstance(raw, str) else "no response")

@@ -78,13 +78,23 @@ def _odata_date(d: datetime.date) -> str:
 def _csrf(service_root: str) -> str:
     """Fetch a CSRF token from THIS service's root on the shared session. OData v2
     rejects any write without it; the same sap_session (cookies) is reused for the
-    write. Each service issues against its own root, so we fetch per service."""
-    resp = sap_session.get(
-        f"{service_root}/", params={"sap-client": SAP_CLIENT},
-        auth=(SAP_USER, SAP_PASS),
-        headers={"X-CSRF-Token": "Fetch", "Accept": "application/json"},
-        timeout=120, verify=False)
-    return resp.headers.get("x-csrf-token", "")
+    write. Each service issues against its own root, so we fetch per service.
+
+    SELF-HEAL: if the session expired (empty token), clear the stale cookies and re-fetch
+    once on a fresh handshake -- so an idle write session recovers instead of blocking."""
+    def _fetch() -> str:
+        resp = sap_session.get(
+            f"{service_root}/", params={"sap-client": SAP_CLIENT},
+            auth=(SAP_USER, SAP_PASS),
+            headers={"X-CSRF-Token": "Fetch", "Accept": "application/json"},
+            timeout=120, verify=False)
+        return resp.headers.get("x-csrf-token", "")
+
+    token = _fetch()
+    if not token:
+        sap_session.cookies.clear()
+        token = _fetch()
+    return token
 
 
 def _preview(verb: str, url: str, body: dict | list | None) -> str:
@@ -339,6 +349,84 @@ def read_pir(material: str, supplier: str = "") -> str:
     return _card(text, "pir", "read", material=material, number=f.get("number"), supplier=f.get("supplier"),
                  price=f.get("price"), currency=f.get("currency"), purch_org=f.get("purch_org"),
                  lead_time_days=f.get("lead_time_days"), min_qty=f.get("min_qty"), sources=sources)
+
+
+@mcp.tool()
+def set_supplier_terms(material: str, supplier: str = "", net_price: float | None = None,
+                       lead_time_days: int | None = None, min_order_qty: float | None = None,
+                       plant: str = "", confirm: bool = False) -> str:
+    """Correct an EXISTING Purchase Info Record's TERMS -- net price, planned delivery (lead) time,
+    min order quantity -- by MATERIAL (+ optional supplier). USE THIS for "change the PIR price to 7.12"
+    or "switch the lead time to 5 days"; it resolves the PIR's full org-data key for you (the key needs
+    PurchasingInfoRecord + Category + PurchasingOrganization + Plant -- hand-building it fails). Pass only
+    the field(s) you want to change. confirm=false PREVIEWS; confirm=true COMMITS.
+
+    Args:
+        material: the bought material the PIR is for, e.g. "12181".
+        supplier: optional -- narrow to one supplier when the material has several PIRs.
+        net_price: new net price amount (e.g. 7.12).
+        lead_time_days: new planned delivery time in days.
+        min_order_qty: new minimum order quantity.
+        plant: target the plant-level row (default = system plant).
+    """
+    if net_price is None and lead_time_days is None and min_order_qty is None:
+        return "Nothing to change -- pass at least one of net_price, lead_time_days, min_order_qty."
+    plant = plant or _DEF_PLANT
+    filt = f"Material eq '{_esc(material)}'" + (f" and Supplier eq '{_esc(supplier)}'" if supplier else "")
+    raw = _sap_get(f"{INFOREC_PATH}/A_PurchasingInfoRecord",
+                   {"$filter": filt, "$expand": "to_PurgInfoRecdOrgPlantData", "$top": 25})
+    try:
+        recs = json.loads(raw).get("d", {}).get("results", [])
+    except (json.JSONDecodeError, AttributeError):
+        recs = []
+    if not recs:
+        return f"No purchase info record for material {material}" + (f" / supplier {supplier}" if supplier else "") + "."
+    if len(recs) > 1 and not supplier:
+        sup = ", ".join(f"{r.get('Supplier')} (PIR {r.get('PurchasingInfoRecord')})" for r in recs)
+        return f"Material {material} has {len(recs)} PIRs -- specify supplier. Suppliers: {sup}."
+    rec = recs[0]
+    org_rows = (rec.get("to_PurgInfoRecdOrgPlantData") or {}).get("results") or []
+    if not org_rows:
+        return f"PIR {rec.get('PurchasingInfoRecord')} has no org/plant data row to update."
+    # Prefer the PLANT-level row (the one that drives purchasing/MRP); fall back to any row.
+    tgt = next((o for o in org_rows if str(o.get("Plant")) == str(plant)), None) \
+        or next((o for o in org_rows if o.get("Plant")), None) or org_rows[0]
+    key = {"PurchasingInfoRecord": tgt.get("PurchasingInfoRecord"),
+           "PurchasingInfoRecordCategory": tgt.get("PurchasingInfoRecordCategory"),
+           "PurchasingOrganization": tgt.get("PurchasingOrganization"),
+           "Plant": tgt.get("Plant")}
+    fields, changes = {}, []
+    if net_price is not None:
+        fields["NetPriceAmount"] = str(net_price); changes.append(f"price {tgt.get('NetPriceAmount')}->{net_price}")
+    if lead_time_days is not None:
+        fields["MaterialPlannedDeliveryDurn"] = str(lead_time_days); changes.append(f"lead {tgt.get('MaterialPlannedDeliveryDurn')}->{lead_time_days}d")
+    if min_order_qty is not None:
+        fields["MinimumPurchaseOrderQuantity"] = str(min_order_qty); changes.append(f"min-qty ->{min_order_qty}")
+    res = change_material_view("A_PurgInfoRecdOrgPlantData", key, fields, operation="update",
+                               service="API_INFORECORD_PROCESS_SRV", confirm=confirm)
+    head = (f"{'PREVIEW -- would update' if not confirm else 'Updated'} PIR {key['PurchasingInfoRecord']} "
+            f"({rec.get('Supplier')}) for {material} @ {key['Plant'] or 'org'}: " + ", ".join(changes) + ".")
+    if not confirm:
+        return f"{head}\n{res}"
+    # VERIFY-AFTER-WRITE: some PIR fields (notably NetPriceAmount) are creatable but NOT patchable -- SAP
+    # returns 204 yet silently ignores them. Re-read and report what actually stuck, so we never lie.
+    kp = ",".join(f"{k}='{v}'" for k, v in key.items())
+    back = _sap_get(f"{INFOREC_PATH}/A_PurgInfoRecdOrgPlantData({kp})")
+    try:
+        now = json.loads(back).get("d", {})
+    except (json.JSONDecodeError, AttributeError):
+        now = {}
+    ignored = [f for f, v in fields.items() if now and str(now.get(f)) != str(v)]
+    if now and ignored:
+        names = {"NetPriceAmount": "net price", "MaterialPlannedDeliveryDurn": "lead time",
+                 "MinimumPurchaseOrderQuantity": "min qty"}
+        human = ", ".join(names.get(f, f) for f in ignored)
+        warn = ("\n[!] NOT APPLIED by SAP (accepted the request but ignored these fields -- they are not "
+                f"updatable on the info record via OData): {human}. "
+                + ("The PIR NET PRICE is held in the PB00 cost CONDITION, not this field -- correct it with "
+                   "change_cost_condition / set it right at creation. " if "NetPriceAmount" in ignored else ""))
+        return f"{head}\n{res}{warn}"
+    return f"{head}\n{res}\nverified: " + ", ".join(f"{f}={now.get(f)}" for f in fields) if now else f"{head}\n{res}"
 
 
 # =============================================================================
@@ -715,6 +803,144 @@ def create_cost_condition(material: str, supplier: str, price: float,
     return _card(msg, "cost", "written", number=cond, scales=added, **_cardf)
 
 
+def _via_mcp():
+    """The mcp_route module if SAP_VIA_MCP is on, else None -- lets the cost resolver read/write through
+    the cloud mcp-costcond instead of in-process OData (same raw-JSON shapes, so parsing is unchanged)."""
+    try:
+        import mcp_route as _mr
+        return _mr if _mr.VIA_MCP else None
+    except Exception:
+        return None
+
+
+def _cost_records_for(material: str, supplier: str = "") -> list[dict]:
+    """Find purchasing price CONDITION records for a material (+ optional supplier).
+    Returns [{ConditionRecord, Supplier, ConditionType, rate, currency, valid_to}] newest first."""
+    _mr = _via_mcp()
+    if _mr:
+        # Cloud mcp-costcond truncates its text at 2500 chars, so json.loads can fail on a material with
+        # several conditions -> salvage the ConditionRecords + rate/currency by regex (truncation-proof).
+        import re
+        vtxt = _mr.call("cost", "read_cost_condition", {"material": str(material)}
+                        | ({"supplier": supplier} if supplier else {}))
+        crs = []
+        for a, b in re.findall(r"ConditionRecord='?(\w{4,})'?|\"ConditionRecord\":\"(\w{4,})\"", vtxt):
+            c = a or b
+            if c and c not in crs:
+                crs.append(c)
+        out = []
+        for cr in crs:
+            rd = _mr.call("cost", "read_cost_condition", {"condition_record": cr})
+            rate = re.search(r'"ConditionRateValue":"([\d.\-]+)"', rd)
+            cur = re.search(r'"ConditionRateValueUnit":"(\w+)"', rd)
+            out.append({"ConditionRecord": cr, "Supplier": supplier or None, "ConditionType": None,
+                        "rate": rate.group(1) if rate else None,
+                        "currency": cur.group(1) if cur else None, "valid_to": None})
+        out.sort(key=lambda r: str(r["ConditionRecord"]), reverse=True)
+        return out
+    # ---- in-process (flag off): full OData JSON ----
+    filt = f"Material eq '{_esc(material)}'" + (f" and Supplier eq '{_esc(supplier)}'" if supplier else "")
+    raw = _sap_get(f"{COND_SRV.replace(SAP_BASE_URL, '')}/A_PurgPrcgCndnRecdValidity",
+                   {"$filter": filt, "$top": 50})
+    try:
+        vrows = json.loads(raw).get("d", {}).get("results", [])
+    except (json.JSONDecodeError, AttributeError):
+        vrows = []
+    out, seen = [], set()
+    for v in vrows:
+        cr = v.get("ConditionRecord")
+        if not cr or cr in seen:
+            continue
+        seen.add(cr)
+        d = {}
+        try:
+            d = json.loads(_sap_get(f"{COND_SRV.replace(SAP_BASE_URL, '')}/A_PurgPrcgConditionRecord('{_esc(cr)}')")).get("d", {})
+        except (json.JSONDecodeError, AttributeError):
+            pass
+        out.append({"ConditionRecord": cr, "Supplier": v.get("Supplier"),
+                    "ConditionType": v.get("ConditionType") or d.get("ConditionType"),
+                    "rate": d.get("ConditionRateValue"), "currency": d.get("ConditionRateValueUnit"),
+                    "valid_to": v.get("ConditionValidityEndDate")})
+    out.sort(key=lambda r: str(r["ConditionRecord"]), reverse=True)     # newest (highest number) first
+    return out
+
+
+@mcp.tool()
+def read_cost_condition(material: str, supplier: str = "") -> str:
+    """READ the purchasing price CONDITION(s) (PPR0 etc.) for a MATERIAL (+ optional supplier) -- the
+    record number, the rate (the actual agreed price MRP/PO uses), currency and validity. Use to VERIFY
+    a price or before correcting it with set_condition_price. Multiple records can exist (e.g. repeated
+    genesis runs). Read-only."""
+    recs = _cost_records_for(material, supplier)
+    if not recs:
+        return _card(f"No purchasing price condition for {material}" + (f" / {supplier}" if supplier else "") + ".",
+                     "cost", "read", material=material, supplier=supplier or None, conditions=[])
+    text = (f"Price condition(s) for {material}" + (f" / {supplier}" if supplier else "") + " -- "
+            + "; ".join(f"{r['ConditionRecord']} {r['ConditionType']} @ {r['rate']} {r.get('currency') or ''}".strip()
+                        for r in recs))
+    f = recs[0]
+    return _card(text, "cost", "read", material=material, supplier=f.get("Supplier"),
+                 number=f.get("ConditionRecord"), price=f.get("rate"), currency=f.get("currency"),
+                 conditions=recs)
+
+
+@mcp.tool()
+def set_condition_price(material: str, price: float, supplier: str = "",
+                        condition_record: str = "", confirm: bool = False) -> str:
+    """Correct the PRICE on an existing purchasing price CONDITION -- the real lever for what MRP/POs pay
+    (the info-record NetPriceAmount field is NOT updatable here; this is). Resolves the condition record
+    for the material (+ optional supplier) and PATCHes its ConditionRateValue; pass condition_record to
+    target a specific one when several exist. Verifies after writing. confirm=false PREVIEWS.
+
+    Args:
+        material: the bought material.
+        price: the new condition rate (e.g. 7.12).
+        supplier: optional -- narrow when the material has conditions from several suppliers.
+        condition_record: optional -- the exact ConditionRecord to update (else the newest is used).
+        plant: n/a (conditions are purchasing-org level).
+    """
+    recs = _cost_records_for(material, supplier)
+    if not recs:
+        return f"No price condition for {material}" + (f" / {supplier}" if supplier else "") + " -- create one first."
+    if condition_record:
+        tgt = next((r for r in recs if str(r["ConditionRecord"]) == str(condition_record)), None)
+        if not tgt:
+            return f"ConditionRecord {condition_record} not found for {material}. Have: " + ", ".join(r["ConditionRecord"] for r in recs)
+    else:
+        tgt = recs[0]
+        if len(recs) > 1:
+            others = ", ".join(f"{r['ConditionRecord']}(@{r['rate']})" for r in recs)
+            note = f" NOTE: {len(recs)} conditions exist [{others}] -- updated the newest; pass condition_record to target another."
+        else:
+            note = ""
+    # The rate is rejected (HTTP 400) unless the currency UNIT travels with it -- always send both.
+    fields = {"ConditionRateValue": str(price), "ConditionRateValueUnit": tgt.get("currency") or _DEF_CURRENCY}
+    _mr = _via_mcp()
+    if _mr:                                              # cloud mcp-costcond.change_cost_condition
+        res = _mr.call("cost", "change_cost_condition",
+                       {"entity": "A_PurgPrcgConditionRecord", "keys": {"ConditionRecord": tgt["ConditionRecord"]},
+                        "fields": fields, "operation": "update", "confirm": bool(confirm)})
+    else:
+        res = change_material_view("A_PurgPrcgConditionRecord", {"ConditionRecord": tgt["ConditionRecord"]},
+                                   fields, operation="update",
+                                   service="API_PURGPRCGCONDITIONRECORD_SRV", confirm=confirm)
+    head = (f"{'PREVIEW -- would set' if not confirm else 'Set'} price condition {tgt['ConditionRecord']} "
+            f"({tgt.get('Supplier')}) for {material}: rate {tgt.get('rate')} -> {price}.")
+    if not confirm:
+        return f"{head}\n{res}" + (note if (not condition_record and len(recs) > 1) else "")
+    # verify-after-write
+    try:
+        rawv = (_mr.call("cost", "read_cost_condition", {"condition_record": tgt["ConditionRecord"]}) if _mr
+                else _sap_get(f"{COND_SRV.replace(SAP_BASE_URL, '')}/A_PurgPrcgConditionRecord('{_esc(tgt['ConditionRecord'])}')"))
+        now = json.loads(rawv).get("d", {})
+        applied = str(now.get("ConditionRateValue")) == str(price)
+    except (json.JSONDecodeError, AttributeError):
+        applied = None
+    verdict = (f"\nverified: rate is now {price}." if applied else
+               "\n[!] WARNING: SAP accepted the request but the rate did not change." if applied is False else "")
+    return f"{head}\n{res}{verdict}" + (note if (not condition_record and len(recs) > 1) else "")
+
+
 # =============================================================================
 # 4) ROUTING  (the MADE operations)   CA01   -- 3-level deep insert
 # =============================================================================
@@ -875,6 +1101,56 @@ def get_routing(material: str, plant: str = "") -> str:
     text = (f"Routing group {grp} for {material} @ plant {plant} -- {len(ops)} operation(s): "
             + " -> ".join(f"{o['operation']} {o.get('text') or ''}".strip() for o in ops))
     return _card(text, "routing", "read", material=material, plant=plant, number=grp, counter=ctr, operations=ops)
+
+
+@mcp.tool()
+def set_routing_operation(material: str, operation: str, work_center: str,
+                          plant: str = "", confirm: bool = False) -> str:
+    """Repoint a routing OPERATION to a different WORK CENTER -- the common routing edit -- by MATERIAL +
+    operation NUMBER + work-center code/name. Use THIS for "change the work center of operation 10 to
+    TECHNIC"; it resolves everything internally so you never guess internal keys:
+      1) material -> its routing group/counter,
+      2) the operation row -> its FULL OData key (the internal op id/version/sequence, NOT the op number),
+      3) the work-center code/name -> its WorkCenterInternalID,
+    then PATCHes the operation. (The generic change_routing needs the exact internal key; this does not.)
+
+    confirm=false PREVIEWS (no write); confirm=true COMMITS.
+
+    Args:
+        material: the made material whose routing to edit, e.g. "12176".
+        operation: the operation NUMBER as shown by get_routing, e.g. "10".
+        work_center: target work-center code or name, e.g. "TECHNIC" / "drilling" (resolved per plant).
+        plant: plant code (default = system plant).
+    """
+    plant = plant or _DEF_PLANT
+    asg = (_routing_rows("ProductionRoutingMatlAssgmt", f"Product eq '{_esc(material)}' and Plant eq '{_esc(plant)}'")
+           or _routing_rows("ProductionRtgMatlAssgmt", f"Material eq '{_esc(material)}' and Plant eq '{_esc(plant)}'"))
+    if not asg:
+        return f"No routing found for {material} @ plant {plant} -- create one first."
+    grp = asg[0].get("ProductionRoutingGroup")
+    ctr = asg[0].get("ProductionRouting")
+    op_filter = f"ProductionRoutingGroup eq '{_esc(grp)}'" + (f" and ProductionRouting eq '{_esc(ctr)}'" if ctr else "")
+    rows = _routing_rows("ProductionRoutingOperation", op_filter)
+    want = str(operation).strip().lstrip("0") or "0"
+    match = [o for o in rows if (str(o.get("Operation") or "").lstrip("0") or "0") == want]
+    if not match:
+        avail = ", ".join(str(o.get("Operation")) for o in rows) or "(none)"
+        return f"Operation {operation} not found in routing {grp} for {material}. Operations present: {avail}."
+    op = match[0]
+    iid, cands = _resolve_work_center(work_center, plant)
+    if not iid:
+        names = ", ".join(f"{r.get('work_center')}" for r in (cands or [])) or "call find_work_center to list them"
+        return f"Work center '{work_center}' not resolved for plant {plant}. Did you mean: {names}?"
+    key = {"ProductionRoutingGroup": op["ProductionRoutingGroup"], "ProductionRouting": op["ProductionRouting"],
+           "ProductionRoutingSequence": op["ProductionRoutingSequence"],
+           "ProductionRoutingOpIntID": op["ProductionRoutingOpIntID"],
+           "ProductionRoutingOpIntVersion": op["ProductionRoutingOpIntVersion"]}
+    was = op.get("WorkCenterInternalID")
+    res = change_material_view("ProductionRoutingOperation", key, {"WorkCenterInternalID": str(iid)},
+                               operation="update", service="API_PRODUCTION_ROUTING", confirm=confirm)
+    head = (f"{'PREVIEW -- would repoint' if not confirm else 'Repointed'} {material} routing {grp} "
+            f"operation {operation} -> work center {work_center} (id {iid}, was {was}).")
+    return f"{head}\n{res}"
 
 
 # =============================================================================

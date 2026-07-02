@@ -38,6 +38,24 @@ _DEF_PLANT = os.getenv("SAP_PLANT", "1710")
 # The production version (MKAL) lives on YOUR remote RFC MCP server -- the ADK app holds no SAP SDK,
 # so genesis reaches it the same way the agents do: over MCP. URL matches main.py's PRODVER_MCP_URL.
 PRODVER_MCP_URL = os.getenv("PRODVER_MCP_URL", "http://127.0.0.1:8002/sse")
+# SAP_VIA_MCP on -> route the WHOLE genesis chain through the cloud fleet: rebind the in-process SAP
+# writers (sap.py/make.py) to signature-matched cloud shims, and use the CF prod-version route (retires
+# local :8002). Explicit PRODVER_MCP_URL env still wins. Flag OFF -> nothing here changes (demo-safe).
+try:
+    import mcp_route as _mr  # noqa: E402
+    if _mr.VIA_MCP:
+        if not os.getenv("PRODVER_MCP_URL"):
+            PRODVER_MCP_URL = _mr.SERVERS["prodver"][0]
+        get_material = _mr.s_get_material
+        create_material = _mr.s_create_material
+        extend_to_plant = _mr.s_extend_to_plant
+        change_material_view = _mr.s_change_material_view
+        create_info_record = _mr.s_create_info_record
+        create_cost_condition = _mr.s_create_cost_condition
+        create_bom = _mr.s_create_bom
+        create_routing = _mr.s_create_routing
+except Exception:
+    pass
 _DEF_ROUTING = [{"operation": "10", "text": "Final Assembly", "work_center": "ASSEMBLY"},
                 {"operation": "20", "text": "Packaging", "work_center": "PACK01"}]
 
@@ -58,7 +76,14 @@ def _readback(matnr):
 
 
 def _new_matnr(res: str) -> str | None:
-    m = re.search(r'"Product":"(\w+)"', res)
+    # SAP's 201 create response returns the new key several ways: as a "Product":"12449" field
+    # (sometimes serialized with whitespace after the colon) OR only inside __metadata as
+    # A_Product('12449'). The old regex matched only the tight no-space field form, so a whitespace
+    # or metadata-only response made this return None -> genesis FALSELY aborted a parent it had just
+    # created (HTTP 201), spawning duplicate FERTs and a dedup-reuse cascade. Tolerate both shapes.
+    m = re.search(r'"Product"\s*:\s*"(\w+)"', res)
+    if not m:
+        m = re.search(r"A_Product\('(\w+)'\)", res)
     return m.group(1) if m else None
 
 
@@ -119,11 +144,22 @@ def _run_async(make_coro):
 _LOT_SIZE = {"BSTMI": "1", "BSTMA": "10000"}
 
 
+def _note_mcp(url):                                  # TELEMETRY: count a prodver cloud call under its server
+    try:
+        import re
+        import mcp_route as _mr
+        m = re.match(r"https?://([^./]+)", url)
+        _mr._note_call(m.group(1) if m else url)
+    except Exception:
+        pass
+
+
 def _create_production_version(material, plant, desc):
     """Create the PRODUCTION VERSION (MKAL) on the remote :8002 RFC MCP server -- the final
     master-data object that binds the BOM (alt 01 / usage 1) + sets lot size 1..10000 so MRP can
     plan it (clears MD408). Returns (ok: bool, message: str). ok=False (with a clear reason) if
     :8002 is unreachable or the FM reports failure -- never raises."""
+    _note_mcp(PRODVER_MCP_URL)
     args = {"material": str(material), "plant": str(plant), "version": "0001",
             "text": f"{(desc or str(material))[:28]} version 1",
             "bom_usage": "1", "bom_alt": "01", "testrun": False, "extra_fields": _LOT_SIZE}
@@ -156,6 +192,41 @@ def _create_production_version(material, plant, desc):
     ok = not is_err and not any(x in txt.lower()
                                 for x in ("error", "fail", "exception", "not found", "invalid"))
     return ok, (txt or "(no text)")
+
+
+def _call_prodver(tool: str, args: dict) -> str:
+    """Call a tool on the remote :8002 RFC MCP server and return its text result. Used by the READ
+    tools below (read_production_version / read_routing). Never raises -- returns an ':8002 ...' note
+    if the server is unreachable, so the caller (a verifier) can report it honestly."""
+    _note_mcp(PRODVER_MCP_URL)
+    async def _go():
+        async with sse_client(PRODVER_MCP_URL, timeout=5, sse_read_timeout=60) as (r, w):
+            async with ClientSession(r, w) as session:
+                await session.initialize()
+                res = await session.call_tool(tool, args)
+                txt = " ".join(c.text for c in res.content if getattr(c, "type", "") == "text").strip()
+                return txt
+    try:
+        return _run_async(_go)
+    except Exception as e:
+        leaf = e
+        while getattr(leaf, "exceptions", None):
+            leaf = leaf.exceptions[0]
+        return f":8002 unreachable/failed -- {type(leaf).__name__}: {leaf}"
+
+
+def read_production_version(material: str, plant: str = "1710") -> str:
+    """READ the production version(s) for a material+plant from table MKAL (via the :8002 RFC server).
+    Returns each VERID + the BOM it binds (STLAN usage / STLAL alternative). An empty list ("count": 0)
+    means NO production version exists yet -- a real gap a made material (FERT/HALB) must have one."""
+    return _call_prodver("read_production_version", {"material": str(material), "plant": str(plant)})
+
+
+def read_routing(material: str, plant: str = "1710") -> str:
+    """READ the routing(s) assigned to a material+plant from table MAPL (via the :8002 RFC server).
+    Returns each routing's group (PLNNR) + counter (PLNAL). An empty list ("count": 0) means NO routing
+    exists yet -- a real gap a made material (FERT/HALB) must have one."""
+    return _call_prodver("read_routing", {"material": str(material), "plant": str(plant)})
 
 
 def _create_material(spec: dict, plant: str) -> tuple[str | None, str]:
@@ -252,9 +323,99 @@ def genesis_from_csv(path: str) -> dict:
 
 
 @mcp.tool()
+def _norm_name(s: str) -> str:
+    """Normalise a part description for shared-raw dedup within ONE genesis run."""
+    return " ".join((s or "").lower().split())
+
+
+def _build_made_subassembly(c: dict, plant: str, sp, report: list, created_raws: dict, _dd) -> dict | None:
+    """Build ONE made (HALB) component's OWN sub-structure: its raw children (deduped across the run so a
+    shared raw like epoxy/bolts is created once), its BOM (HALB + children), routing, and production
+    version. `c` must carry c['material'] (created in the component pass) and c['components'] (sub-parts).
+    This is what makes genesis MULTI-LEVEL: every made node, not just the FERT, gets BOM+routing+PV."""
+    halb = c.get("material")
+    children = c.get("components") or []
+    if not halb or not children:
+        return None
+    sub = {"material": halb, "name": c.get("name"), "description": c.get("description"),
+           "children": [], "bom": None, "routing": None, "production_version": None}
+    child_rows = []
+    for ch in children:
+        cmat = ch.get("material")
+        cdesc = ch.get("description") or ch.get("name") or ""
+        if not _exists(cmat):
+            key = _norm_name(cdesc)
+            if key in created_raws:                       # shared raw already made this run -> reuse
+                cmat = created_raws[key]
+                report.append(f"      raw {ch.get('name')}: reuse {cmat} (shared)")
+            else:
+                cdd = _dd(cdesc)
+                if cdd["is_duplicate"]:
+                    cmat = cdd["match"]["Product"]
+                    report.append(f"      raw {ch.get('name')}: reused {cmat} (semantic dup)")
+                else:
+                    cmat, res = _create_material(ch, plant)
+                    if not cmat:
+                        report.append(f"      raw {ch.get('name')}: CREATE FAILED {res[:80]}")
+                        sp.record(f"raw:{ch.get('name')}", "create raw", "failed", outcome=res[:80])
+                        continue
+                    report.append(f"      raw {ch.get('name')}: created {cmat} [{ch.get('type', 'ROH')}]")
+                    sp.record(f"raw:{ch.get('name')}", "create raw", "created", outcome=f"created {cmat}",
+                              obj=_readback(cmat), writes=1, inputs={"desc": cdesc, "type": ch.get("type", "ROH")})
+                    _vec_add(cmat, cdesc[:60])
+                created_raws[key] = cmat
+            ch["material"] = cmat
+        else:
+            report.append(f"      raw {ch.get('name')}: exists {cmat}")
+        child_rows.append({"component": cmat, "quantity": ch.get("quantity", 1)})
+        sp.add_kg(cmat, ch.get("type", "ROH"), description=cdesc[:40])
+        sp.add_kg(halb, "HALB", edges=[("uses", cmat, {"quantity": ch.get("quantity", 1)})])
+        sub["children"].append({"name": ch.get("name"), "material": cmat,
+                                "quantity": ch.get("quantity", 1), "type": ch.get("type")})
+    # HALB BOM (HALB + its raws) -----------------------------------------------
+    if child_rows:
+        bom = _plain(create_bom(halb, plant, child_rows, confirm=True))
+        bok = "created" in bom.lower() or "ok" in bom.lower()
+        report.append(f"    HALB {halb} BOM: {bom[:100]}")
+        sub["bom"] = {"status": "ok" if bok else "failed", "components": len(child_rows), "message": bom[:120]}
+        sp.record(f"subbom:{halb}", "create HALB BOM", "created" if bok else "failed", outcome=bom[:120],
+                  verified=bok, grounded_by=bom[:120], writes=1 if bok else 0,
+                  inputs={"parent": halb, "components": child_rows})
+    # HALB routing -------------------------------------------------------------
+    rtops = c.get("routing") or _DEF_ROUTING
+    rt = _plain(create_routing(halb, plant, rtops,
+                description=f"{(c.get('description') or '')[:24]} routing", confirm=True))
+    rok = "created" in rt.lower() or "ok" in rt.lower()
+    report.append(f"    HALB {halb} routing: {rt[:90]}")
+    sub["routing"] = {"status": "ok" if rok else "failed",
+                      "operations": [{"operation": o.get("operation"), "text": o.get("text"),
+                                      "work_center": o.get("work_center")} for o in rtops], "message": rt[:120]}
+    sp.record(f"subrouting:{halb}", "create HALB routing", "created" if rok else "failed", outcome=rt[:120],
+              verified=rok, grounded_by=rt[:120], writes=1 if rok else 0, inputs={"parent": halb, "ops": rtops})
+    for o in rtops:
+        sp.add_kg(o["work_center"], "work_center")
+        sp.add_kg(halb, "HALB", edges=[("routed_thru", o["work_center"], {"op": o.get("operation")})])
+    # HALB production version ---------------------------------------------------
+    pv_ok, pv_msg = _create_production_version(halb, plant, c.get("description"))
+    report.append(f"    HALB {halb} PV: {'ok' if pv_ok else 'NOT bound -- ' + pv_msg[:80]}")
+    sub["production_version"] = {"status": "ok" if pv_ok else "failed", "version": "0001",
+                                 "bom_alt": "01", "bom_usage": "1", "message": pv_msg[:120]}
+    sp.record(f"subpv:{halb}", "create HALB production version", "created" if pv_ok else "failed",
+              outcome=pv_msg[:120], verified=pv_ok, grounded_by=pv_msg[:120], writes=1 if pv_ok else 0,
+              inputs={"parent": halb, "version": "0001", "bom_alt": "01", "bom_usage": "1"})
+    sp.add_kg(f"PV-{halb}-0001", "production_version", bound_bom="alt 01 / usage 1")
+    sp.add_kg(halb, "HALB", edges=[("has_production_version", f"PV-{halb}-0001", {})])
+    return sub
+
+
 def run_genesis(spec: dict, confirm: bool = False) -> str:
     """Create a whole assembly's master data from a genesis spec (the heart of Design2Make):
     parent FERT -> component materials -> PIR+cost (bought) -> BOM -> routing.
+
+    MULTI-LEVEL: a made (HALB) component may carry its OWN "components" (its raws/sub-parts) and
+    "routing"; run_genesis then builds that sub-assembly's BOM + routing + production version too, so
+    the whole tree is born MRP-ready in one pass (not just the FERT). A flat spec (no nested
+    components) behaves exactly as before.
 
     SAFETY GATE: confirm=false (default) returns the PLAN (existence checks, what will be
     created) and writes NOTHING. confirm=true performs all creates in order and reports.
@@ -273,7 +434,11 @@ def run_genesis(spec: dict, confirm: bool = False) -> str:
     comps = spec.get("components", [])
     routing = spec.get("routing") or _DEF_ROUTING
     lo, hi = spec.get("dedup_from", _DEDUP_FROM), spec.get("dedup_to", _DEDUP_TO)   # scope the dedup
-    dedup_on = spec.get("dedup", _DEDUP_DEFAULT)     # spec {"dedup": false} OR GENESIS_DEDUP=off -> FRESH build
+    # GENESIS_DEDUP is the MASTER switch. When the rig is launched with it OFF, a genesis is ALWAYS a
+    # fresh build -- the spec CANNOT re-enable reuse (the model often sets {"dedup": true} because the
+    # tool doc used to say "default true", which silently reused day-old materials, e.g. a skateboard
+    # reusing an old bicycle's wheels). Only when GENESIS_DEDUP is ON does the spec get to fine-tune.
+    dedup_on = bool(_DEDUP_DEFAULT) and spec.get("dedup", True)
 
     def _dd(desc):
         """Dedup a description -- UNLESS this run turned dedup off, in which case every part is treated
@@ -321,11 +486,37 @@ def run_genesis(spec: dict, confirm: bool = False) -> str:
                  "type": c.get("type"), "role": c.get("role"), "quantity": c.get("quantity", 1),
                  "material": cmatp, "action": caction, "vendor": c.get("vendor"), "price": c.get("price"),
                  "dedup": cdd})
+            # MULTI-LEVEL preview: a MADE node may carry its own raws/sub-parts -> show them nested and
+            # note it gets its OWN BOM/routing/PV. The image can't show a HALB's raws, so anything the
+            # model INFERRED is flagged so the human vets it before confirm (the "infer + flag" design).
+            sub_children = c.get("components") or []
+            if c.get("role") == "made" and sub_children:
+                kids = []
+                for ch in sub_children:
+                    chex = _exists(ch.get("material"))
+                    chmat = ch.get("material") if chex else None
+                    ktag = f"exists {chmat}" if chex else "CREATE"
+                    flag = " ⚠ inferred" if ch.get("inferred") else ""
+                    out.append(f"      └ {ch.get('name')}: [{ktag}] {ch.get('type', 'ROH')} "
+                               f"x{ch.get('quantity', 1)}{flag}")
+                    kids.append({"name": ch.get("name"), "type": ch.get("type", "ROH"),
+                                 "quantity": ch.get("quantity", 1), "material": chmat,
+                                 "action": "exists" if chex else "create",
+                                 "inferred": bool(ch.get("inferred"))})
+                out.append("        -> gets its OWN BOM + routing + production version (made sub-assembly)")
+                gres["components"][-1]["children"] = kids
+                gres["components"][-1]["subassembly"] = True
+        made_subs = [c for c in comps if c.get("role") == "made" and c.get("components")]
         if has_parent:
-            out.append(f"\nthen BOM (parent + {len(comps)} components)"
+            tag = (f"  +{len(made_subs)} sub-assembly BOM/routing/production-version set(s)"
+                   if made_subs else "")
+            out.append(f"\nthen BOM (parent + {len(comps)} components){tag}"
                        f"  and ROUTING ({' -> '.join(o['work_center'] for o in routing)})")
             out.append("then PRODUCTION VERSION 0001 (bind BOM alt 01 / usage 1) "
                        "-> the assembly becomes MRP-ready (clears MD408).")
+            if made_subs:
+                out.append(f"FULL TREE: {len(made_subs)} made sub-assembly(ies) each get their OWN BOM + "
+                           "routing + production version -> multi-level, born MRP-ready in ONE pass.")
         return _emit("\n".join(out), gres)
 
     report = []
@@ -420,12 +611,17 @@ def run_genesis(spec: dict, confirm: bool = False) -> str:
                 _vec_add(mat, cdesc[:60])             # <-- write-back
                 crow["action"] = "created"
         crow["material"] = mat
+        c["material"] = mat                               # hand the created number back for the sub-assembly pass
         comp_rows.append({"component": mat, "quantity": c.get("quantity", 1)})
         sp.material = sp.material or mat                  # components-only run: anchor on the first part
         sp.add_kg(mat, c.get("type", "HAWA"), description=cdesc[:40])
         sp.add_kg(pmat, "FERT", edges=[("uses", mat, {"quantity": c.get("quantity", 1)})])  # no-op if no parent
         if c.get("role") == "bought" and c.get("vendor"):
-            pir = _plain(create_info_record(mat, c["vendor"], confirm=True))
+            # Pass the (web-sourced) price into the PIR too -- not just the cost condition. Without this
+            # the info record was born at the create_info_record default net_price=0.01 even though the
+            # spec carried a real price, so MD04/purchasing showed 0.01 (session ed478141).
+            _pir_price = float(c["price"]) if c.get("price") not in (None, "") else 0.01
+            pir = _plain(create_info_record(mat, c["vendor"], net_price=_pir_price, confirm=True))
             ok = "Created" in pir
             report.append(f"      PIR: {'ok' if ok else pir[:90]}")
             crow["pir"] = {"status": "ok" if ok else "failed", "vendor": c.get("vendor"), "message": pir[:120]}
@@ -500,6 +696,22 @@ def run_genesis(spec: dict, confirm: bool = False) -> str:
                         "alternatives": ["leave unbound -- NOT MRP-ready"]})
     sp.add_kg(f"PV-{pmat}-0001", "production_version", bound_bom="alt 01 / usage 1")
     sp.add_kg(pmat, "FERT", edges=[("has_production_version", f"PV-{pmat}-0001", {})])
+
+    # 6) SUB-ASSEMBLIES -- every MADE component that carries its OWN children gets its own BOM +
+    #    routing + production version, so the assembly is multi-level and born MRP-ready at EVERY made
+    #    node (no board NO-GO / heal pass needed for the HALB sub-structure). Shared raws (epoxy, bolts,
+    #    CF sheet) are created ONCE and referenced across HALBs. No-op for a flat spec.
+    created_raws: dict = {}
+    subs = []
+    for c in comps:
+        if c.get("role") == "made" and c.get("components"):
+            sub = _build_made_subassembly(c, plant, sp, report, created_raws, _dd)
+            if sub:
+                subs.append(sub)
+    if subs:
+        gres["subassemblies"] = subs
+        report.append(f"SUB-ASSEMBLIES: {len(subs)} made node(s) given their own BOM + routing + "
+                      f"production version ({len(created_raws)} raw material(s) created/deduped)")
 
     final = sp.finalize()
     gres["discipline"] = _discipline_summary(final)

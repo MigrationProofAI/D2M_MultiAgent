@@ -30,6 +30,33 @@ load_dotenv()
 
 MODEL_PROVIDER = os.getenv("MODEL_PROVIDER", "anthropic").lower()   # AI Core only; "openai" is opt-in
 
+# EXTENDED THINKING (anthropic provider only). Off by default -> behaviour identical to today. When on,
+# Claude returns a `thinking` block (its chain-of-thought) before the answer; we surface it as
+# msg.reasoning for the Agent-Activity panel, and round-trip the raw blocks (with signatures) so a
+# multi-step tool loop stays valid. Extended thinking REQUIRES temperature=1.
+THINKING_ON = os.getenv("RIG_THINKING", "off").lower() in ("1", "on", "true", "yes")
+THINKING_BUDGET = int(os.getenv("RIG_THINKING_BUDGET", "8000"))   # was 2000 -> too thin vs Claude.ai
+
+# --- TELEMETRY: per-thread (per-agent) token accounting. Each model call adds its usage; run_turn reads
+#     the turn total and emits it into the activity chain. Thread-local isolates CONCURRENT agents (the
+#     board runs in parallel threads), so each agent's tokens are counted separately. ---
+import threading as _threading
+_usage_tl = _threading.local()
+
+
+def _add_usage(tin, tout):
+    t = getattr(_usage_tl, "u", None) or {"in": 0, "out": 0, "calls": 0}
+    t["in"] += int(tin or 0); t["out"] += int(tout or 0); t["calls"] += 1
+    _usage_tl.u = t
+
+
+def turn_usage(reset=False):
+    """Accumulated token usage on THIS thread: {in, out, calls}. run_turn resets at start, reads at end."""
+    t = getattr(_usage_tl, "u", None) or {"in": 0, "out": 0, "calls": 0}
+    if reset:
+        _usage_tl.u = {"in": 0, "out": 0, "calls": 0}
+    return dict(t)
+
 # Logical model names (unchanged — the openai path uses these directly).
 MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")          # the main loop (cheap, tool-calling)
 SUMMARY_MODEL = os.getenv("RIG_SUMMARY_MODEL", "gpt-4o")  # Step 2 summaries
@@ -174,7 +201,11 @@ class _TC:
 
 
 class _Msg:
-    def __init__(self, content, tool_calls): self.content = content; self.tool_calls = tool_calls or None
+    def __init__(self, content, tool_calls, reasoning=None, thinking_blocks=None):
+        self.content = content
+        self.tool_calls = tool_calls or None
+        self.reasoning = reasoning            # the model's chain-of-thought text (display)
+        self.thinking_blocks = thinking_blocks  # raw thinking blocks (with signatures) for round-trip
 
 
 def _text_of(content) -> str:
@@ -228,6 +259,11 @@ def _to_anthropic(messages):
                 out.append({"role": "user", "content": [block], "_tr": True})
         elif role == "assistant":
             blocks = []
+            # Extended thinking: the raw thinking blocks (with signatures) must lead the assistant turn
+            # and be passed back unmodified, or Anthropic rejects a tool-use continuation. run_turn stores
+            # them on the message as `_thinking`.
+            for tb in msg.get("_thinking") or []:
+                blocks.append(tb)
             t = _text_of(msg.get("content"))
             if t:
                 blocks.append({"type": "text", "text": t})
@@ -268,7 +304,13 @@ def _anthropic_complete(messages, tools, temperature):
     body = {"anthropic_version": ANTHROPIC_VERSION, "max_tokens": ANTHROPIC_MAX_TOKENS, "messages": amsgs}
     if system:
         body["system"] = system
-    if temperature is not None:
+    if THINKING_ON:
+        # Extended thinking requires temperature=1 and max_tokens > budget; surface the chain-of-thought.
+        body["thinking"] = {"type": "enabled", "budget_tokens": THINKING_BUDGET}
+        body["temperature"] = 1
+        if ANTHROPIC_MAX_TOKENS <= THINKING_BUDGET:
+            body["max_tokens"] = THINKING_BUDGET + 2048
+    elif temperature is not None:
         body["temperature"] = temperature
     if tools:
         body["tools"] = _anthropic_tools(tools)
@@ -279,13 +321,22 @@ def _anthropic_complete(messages, tools, temperature):
                          json=body, timeout=180)
     resp.raise_for_status()
     data = resp.json()
-    text, calls = [], []
+    text, calls, think_text, think_blocks = [], [], [], []
     for block in data.get("content", []):
-        if block.get("type") == "text":
+        bt = block.get("type")
+        if bt == "text":
             text.append(block.get("text", ""))
-        elif block.get("type") == "tool_use":
+        elif bt == "tool_use":
             calls.append(_TC(block.get("id"), block.get("name"), json.dumps(block.get("input", {}))))
-    return _Msg("".join(text), calls)
+        elif bt in ("thinking", "redacted_thinking"):
+            think_blocks.append(block)                       # raw, with signature, for round-trip
+            if bt == "thinking":
+                think_text.append(block.get("thinking", ""))
+    _u = data.get("usage") or {}
+    _add_usage(_u.get("input_tokens"), _u.get("output_tokens"))
+    return _Msg("".join(text), calls,
+                reasoning="".join(think_text) or None,
+                thinking_blocks=think_blocks or None)
 
 
 # ---------------------------------------------------------------------------
@@ -308,7 +359,12 @@ def model_complete(messages, tools=None, model=None, temperature=0.2):
     if tools:
         kwargs["tools"] = tools
         kwargs["tool_choice"] = "auto"
-    return client.chat.completions.create(**kwargs).choices[0].message
+    resp = client.chat.completions.create(**kwargs)
+    try:                                              # TELEMETRY: openai/genaihub usage
+        _add_usage(resp.usage.prompt_tokens, resp.usage.completion_tokens)
+    except Exception:
+        pass
+    return resp.choices[0].message
 
 
 def summarize(system, text, model=None):

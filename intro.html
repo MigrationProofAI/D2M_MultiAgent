@@ -1,0 +1,265 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Design2Make — meet the operator</title>
+<style>
+  :root{
+    --bg:#0b1020; --panel:#121a30; --ink:#e8edf7; --dim:#9fb0d0; --line:#2a3a5e;
+    --doer:#5b9dff; --verify:#37d39a; --board:#c89bff; --cond:#ffb86b; --sap:#7ee0ff; --spec:#f7d56b;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%}
+  body{margin:0;background:radial-gradient(1200px 700px at 50% -10%,#16203c 0%,var(--bg) 60%);
+    color:var(--ink);font:16px/1.5 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;
+    display:flex;flex-direction:column;min-height:100vh;overflow:hidden}
+  header{display:flex;align-items:center;gap:12px;padding:18px 26px}
+  .dot{width:12px;height:12px;border-radius:50%;background:var(--doer);
+    box-shadow:0 0 0 4px rgba(91,157,255,.18);animation:beat 2.4s ease-in-out infinite}
+  @keyframes beat{50%{box-shadow:0 0 0 9px rgba(91,157,255,.05)}}
+  .word{font-weight:700;letter-spacing:.2px;font-size:20px}
+  .sub{color:var(--dim);font-size:13px}
+  main{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:0 24px;position:relative}
+
+  /* ---------- diagram ---------- */
+  .diagram{width:min(1040px,96vw);transform:scale(.98);transition:transform .6s}
+  .board{margin:0 auto 6px;max-width:560px;border:1px solid var(--line);border-radius:14px;
+    background:var(--panel);padding:12px 16px;text-align:center;
+    opacity:0;transform:translateY(10px) scale(.96);transition:.6s}
+  .board .ttl{font-weight:700;color:var(--ink)}
+  .board.active .ttl{color:var(--board)}
+  .hitl{margin:12px auto 0;max-width:620px;text-align:center;font-size:13px;color:var(--ink);
+    border:1px solid var(--line);border-radius:12px;padding:8px 14px;background:var(--panel);
+    opacity:0;transform:translateY(8px);transition:.5s}
+  .hitl.on{opacity:1;transform:none}
+  #hitl.active{border-color:var(--verify);box-shadow:0 0 0 2px var(--verify),0 0 30px -8px var(--verify)}
+  #learn.active{border-color:#ffcf6b;box-shadow:0 0 0 2px #ffcf6b,0 0 30px -8px #ffcf6b}
+  #tools.active{border-color:#5cc8ff;box-shadow:0 0 0 2px #5cc8ff,0 0 30px -8px #5cc8ff}
+  .chips{display:flex;gap:8px;justify-content:center;flex-wrap:wrap;margin-top:8px}
+  .chip{font-size:12px;color:var(--dim);border:1px solid var(--line);border-radius:999px;padding:3px 10px;
+    opacity:0;transform:translateY(6px);transition:.45s}
+  .chair{color:#ffe1a8;border-color:#5a4a2a}
+  .cond-line{margin-top:8px;font-size:12px;color:var(--cond);opacity:0;transition:.5s}
+
+  .conductor{border:1.5px dashed transparent;border-radius:18px;padding:14px;transition:.6s;position:relative;margin-top:6px}
+  .conductor .clabel{position:absolute;top:-11px;left:18px;background:var(--bg);padding:0 8px;font-size:12px;
+    color:var(--cond);opacity:0;transition:.5s}
+
+  .row{display:flex;align-items:center;justify-content:center;gap:10px}
+  .stage{flex:0 0 auto;width:172px;min-height:104px;border:1px solid var(--line);border-radius:16px;background:var(--panel);
+    padding:14px;display:flex;flex-direction:column;gap:6px;opacity:0;transform:translateY(12px) scale(.95);
+    transition:opacity .55s,transform .55s,box-shadow .4s,border-color .4s}
+  .stage .ic{font-size:24px}
+  .stage .nm{font-weight:700}
+  .stage .ds{font-size:12.5px;color:var(--dim)}
+  .pair{display:flex;flex-direction:column;gap:10px;align-items:center}
+
+  .arrow{width:46px;height:2px;background:var(--line);position:relative;flex:0 0 auto;transform:scaleX(0);
+    transform-origin:left;transition:transform .5s;opacity:.9}
+  .arrow.up{transform-origin:left}
+  .arrow::after{content:"";position:absolute;right:-1px;top:-4px;border:5px solid transparent;border-left-color:var(--line)}
+  .arrow .lab{position:absolute;top:-20px;left:0;font-size:11px;color:var(--dim);white-space:nowrap;opacity:0;transition:.4s}
+  .arrow.dash{background:repeating-linear-gradient(90deg,var(--line) 0 6px,transparent 6px 11px)}
+  .arrow.dash::after{border-left-color:var(--line)}
+
+  /* heal loop between doer & verifier */
+  .heal{width:172px;height:34px;position:relative;opacity:0;transition:.5s}
+  .heal svg{width:100%;height:100%;overflow:visible}
+  .heal path{fill:none;stroke:var(--verify);stroke-width:2;stroke-dasharray:240;stroke-dashoffset:240;transition:stroke-dashoffset .9s}
+  .heal .lab{position:absolute;left:50%;top:8px;transform:translateX(-50%);font-size:11px;color:var(--verify)}
+
+  /* reveal + active states (added by JS) */
+  .on{opacity:1 !important;transform:none !important}
+  .arrow.on{transform:scaleX(1) !important}
+  .arrow.on .lab,.chip.on{opacity:1;transform:none}
+  .conductor.on{border-color:var(--cond)}
+  .conductor.on .clabel,.cond-line.on{opacity:1}
+  .heal.on{opacity:1}.heal.on path{stroke-dashoffset:0}
+  .active{box-shadow:0 0 0 2px currentColor, 0 0 34px -6px currentColor;animation:pop .5s}
+  #spec.active{color:var(--spec);border-color:var(--spec)}
+  #doer.active{color:var(--doer);border-color:var(--doer)}
+  #verifier.active{color:var(--verify);border-color:var(--verify)}
+  #sap.active{color:var(--sap);border-color:var(--sap)}
+  #plan.active{color:var(--cond);border-color:var(--cond)}
+  .board.active{box-shadow:0 0 0 1px var(--board),0 0 34px -8px var(--board)}
+  @keyframes pop{0%{transform:scale(1)}40%{transform:scale(1.04)}100%{transform:scale(1)}}
+  /* keep text readable inside an active (colored) card */
+  .stage.active .nm,.stage.active .ic{color:var(--ink)}
+
+  /* ---------- caption + controls ---------- */
+  .caption{min-height:72px;max-width:860px;margin:26px auto 0;text-align:center;font-size:19px;line-height:1.55;
+    color:#eef3ff;opacity:0;transition:opacity .4s}
+  .caption.show{opacity:1}
+  .me{color:var(--doer);font-weight:600}
+  footer{display:flex;align-items:center;justify-content:center;gap:14px;padding:18px}
+  button{background:var(--panel);color:var(--ink);border:1px solid var(--line);border-radius:10px;
+    padding:9px 16px;font-size:14px;cursor:pointer;transition:.2s}
+  button:hover{border-color:var(--doer);color:#fff}
+  .ghost{background:transparent;color:var(--dim)}
+  .progress{display:flex;gap:6px}
+  .pdot{width:7px;height:7px;border-radius:50%;background:var(--line);transition:.3s}
+  .pdot.done{background:var(--doer)}
+  .hint{position:absolute;bottom:8px;color:var(--dim);font-size:12px;opacity:.7}
+  .closebadge{opacity:0;transition:.6s;text-align:center;margin-top:10px}
+  .closebadge.on{opacity:1}
+  .closebadge .big{font-size:26px;font-weight:800;letter-spacing:.3px}
+  .closebadge .tag{color:var(--dim);font-size:13px}
+</style>
+</head>
+<body>
+  <header>
+    <span class="dot"></span>
+    <div><div class="word">Design2Make</div><div class="sub">a multi-agent operator — SAP master data &amp; planning</div></div>
+  </header>
+
+  <main>
+    <div class="diagram">
+      <div class="board" id="board">
+        <div class="ttl">🏛 Boardroom</div>
+        <div class="chips">
+          <span class="chip">Engineering</span><span class="chip">Procurement</span>
+          <span class="chip">Compliance</span><span class="chip">Finance</span>
+          <span class="chip">Planning</span><span class="chip chair">⚖ Chair · go / no-go</span>
+        </div>
+      </div>
+
+      <div class="conductor" id="conductor">
+        <span class="clabel">🎼 Conductor · orchestrates & enforces authority</span>
+        <div class="row">
+          <div class="stage" id="spec"><div class="ic">📷</div><div class="nm">Your product</div><div class="ds">photo · screenshot · sketch · words</div></div>
+          <div class="arrow" id="a-spec"><span class="lab">perceive</span></div>
+          <div class="stage" id="doer"><div class="ic">🛠</div><div class="nm">Maker</div><div class="ds">material · PIR · price · BOM · routing · prod-version</div></div>
+          <div class="heal" id="heal">
+            <span class="lab">↩ heal loop</span>
+            <svg viewBox="0 0 172 34"><path d="M150,6 C150,30 22,30 22,8" /></svg>
+          </div>
+          <div class="stage" id="verifier"><div class="ic">🛡</div><div class="nm">Verifier</div><div class="ds">re-reads SAP · certifies</div></div>
+          <div class="arrow dash" id="a-ver"><span class="lab">reads</span></div>
+          <div class="stage" id="sap"><div class="ic">🗄</div><div class="nm">SAP S/4HANA</div><div class="ds">real master data</div></div>
+          <div class="arrow" id="a-plan"><span class="lab">plan</span></div>
+          <div class="stage" id="plan"><div class="ic">📈</div><div class="nm">Plan to make</div><div class="ds">demand (PIR) · MRP · planned orders</div></div>
+        </div>
+        <div class="hitl" id="hitl">🙋 <b>Genesis preview &amp; human-in-the-loop</b> — I preview the whole plan; you approve every write</div>
+        <div class="hitl" id="learn">🧠 <b>Skills &amp; learning</b> — loads the right skill · learns from mistakes · promotes new skills for next time</div>
+        <div class="hitl" id="tools">🔌 <b>MCP tool contracts</b> — typed tools that bake SAP OData &amp; RFC · material · BOM · routing · PIR · price · demand · MRP</div>
+      </div>
+      <div class="closebadge" id="closebadge">
+        <div class="big">Design2Make</div>
+        <div class="tag">I build it · I check my own work · I show you everything</div>
+      </div>
+    </div>
+
+    <div class="caption" id="caption"></div>
+    <div class="hint" id="hint">click anywhere to begin · space to skip a line</div>
+  </main>
+
+  <footer>
+    <div class="progress" id="progress"></div>
+    <button id="replay" class="ghost" style="display:none">↻ Replay</button>
+    <button id="mute" class="ghost">🔊 Voice on</button>
+  </footer>
+
+<script>
+// ---- the honest, first-person script. Each scene: caption (html) + diagram cues. ----
+const SCENES = [
+  { t:`Hi — I'm <span class="me">Design2Make</span>. Not one assistant, but a team of agents that takes a product — however you describe it — all the way to real, verified SAP master data, and the plan to make it.`,
+    on:[], active:[] },
+  { t:`It starts with you, however you have it: a photo or a screenshot, a sketch of a design, or just a few words describing the product. I take it in and work out what it's made of.`,
+    on:["spec"], active:["spec"] },
+  { t:`Then one of me — the <span class="me">Maker</span> — works out how to build it all in SAP: the materials, the purchasing info records that source the bought parts, the prices, the bills of materials, the routings, and the production version that ties it together.`,
+    on:["a-spec","doer"], active:["doer"] },
+  { t:`But before any of it touches SAP, I show you the whole thing first — a Genesis preview of every material, BOM, routing and price. Nothing is written until you approve it. You're in the loop on every commit.`,
+    on:["hitl"], active:["hitl"] },
+  { t:`Only once you say yes do I commit — and each one is a real write to S/4HANA.`,
+    on:["sap"], active:["sap"] },
+  { t:`Here's the part I care about most. A <em>different</em> me — the <span class="me" style="color:var(--verify)">Verifier</span> — independently re-reads SAP and certifies the result. The one who builds is never the one who signs off.`,
+    on:["verifier","a-ver"], active:["verifier"] },
+  { t:`If something's missing, a capped loop hands it back to the Maker and checks again — until it's right, or I honestly tell you it isn't.`,
+    on:["heal"], active:["verifier","doer"] },
+  { t:`But master data is only half of 'design to make'. I also create the demand — planned independent requirements, month by month — run MRP, and read the plan back: the planned orders and purchase requisitions that prove it can actually be made.`,
+    on:["a-plan","plan"], active:["plan"] },
+  { t:`Before I commit the big changes, a <span class="me" style="color:var(--board)">boardroom</span> — Engineering, Procurement, Compliance, Finance and Planning — reviews the plan, and a Chair gives a single go or no-go.`,
+    on:["board"], active:["board"] },
+  { t:`A <span class="me" style="color:var(--cond)">Conductor</span> runs the room and enforces authority. That's the team: a Maker that builds, a Verifier that certifies, a Board that reviews, a Guide that explains — each one bounded to exactly what it's allowed to do.`,
+    on:["conductor"], active:["conductor"] },
+  { t:`I don't improvise everything, either. I carry <span class="me" style="color:#ffcf6b">skills</span> — focused playbooks — and load only the one that fits the task, so I act like a specialist, not a generalist guessing.`,
+    on:["learn"], active:["learn"] },
+  { t:`And I learn. When something goes wrong I keep the lesson so I don't repeat it — and I can turn what works into a new skill, promoted for every future session. I get better the more we work together.`,
+    on:["learn"], active:["learn"] },
+  { t:`Under all of it, every action I take is a typed <span class="me" style="color:#5cc8ff">MCP tool</span> — a clean contract that bakes a real SAP service underneath, OData or RFC. The agents reason; the tools do the SAP plumbing — tokens, keys, deep inserts, preview-then-commit — so nothing touches raw OData by hand.`,
+    on:["tools"], active:["tools"] },
+  { t:`And I try to be honest about my limits — a price that really lives in a pricing condition, a soft-delete instead of a hard one, a field SAP won't let me change. I'll tell you what I couldn't do, not just what I did.`,
+    on:[], active:[] },
+  { t:`And everything I think and do streams live on screen, and is saved — so you can see exactly how I reached every result, and revisit it later.`,
+    on:[], active:[] },
+  { t:`That's me — Design2Make. From a photo, a sketch or a sentence to master data, a verified build and a real production plan — with you in the loop, learning as I go, and showing you everything. So — why not upload an image of a product and ask me to run the genesis?`,
+    on:["spec","a-spec","doer","hitl","heal","verifier","a-ver","sap","a-plan","plan","board","conductor","learn"], active:[], close:true },
+];
+
+const $=s=>document.querySelector(s), cap=$("#caption");
+let i=-1, playing=false, voiceOn=true, audio=null, advTimer=null, started=false;
+
+// build progress dots
+const prog=$("#progress");
+SCENES.forEach(()=>{const d=document.createElement("span");d.className="pdot";prog.appendChild(d);});
+const pdots=[...document.querySelectorAll(".pdot")];
+
+function applyCues(s){
+  // cumulative reveal: add .on to everything up to & including this scene
+  // (recompute from scratch so replay/skip stay consistent)
+  const onSet=new Set(), activeSet=new Set(s.active||[]);
+  for(let k=0;k<=i;k++){(SCENES[k].on||[]).forEach(x=>onSet.add(x));}
+  ["spec","doer","verifier","sap","plan","hitl","learn","tools","board","conductor","heal","a-spec","a-ver","a-plan"].forEach(id=>{
+    const el=document.getElementById(id); if(!el)return;
+    el.classList.toggle("on",onSet.has(id));
+    el.classList.toggle("active",activeSet.has(id));
+  });
+  // doer->sap arrow label flips to "writes" once we reach the write scene
+  const aver=document.getElementById("a-ver");
+  $("#closebadge").classList.toggle("on",!!s.close);
+}
+
+async function speak(text){
+  if(!voiceOn) return null;
+  try{
+    const r=await fetch("/api/tts",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({text:text.replace(/<[^>]+>/g,"").slice(0,800)})});
+    const b64=r.ok?((await r.json()).audio_b64||""):"";
+    if(!b64) return null;
+    const bin=atob(b64),u=new Uint8Array(bin.length);for(let k=0;k<bin.length;k++)u[k]=bin.charCodeAt(k);
+    return URL.createObjectURL(new Blob([u],{type:"audio/mpeg"}));
+  }catch(e){return null;}
+}
+
+function clearTimers(){ if(advTimer){clearTimeout(advTimer);advTimer=null;} if(audio){audio.pause();audio=null;} }
+
+async function show(n){
+  if(n>=SCENES.length){ end(); return; }
+  i=n; const s=SCENES[i];
+  pdots.forEach((d,k)=>d.classList.toggle("done",k<=i));
+  cap.classList.remove("show");
+  applyCues(s);
+  setTimeout(()=>{cap.innerHTML=s.t;cap.classList.add("show");},180);
+  clearTimers();
+  const url=await speak(s.t);
+  const fallbackMs=Math.max(3600, s.t.replace(/<[^>]+>/g,"").split(/\s+/).length*330);
+  if(url){
+    audio=new Audio(url); audio.onended=()=>{ if(i===n) next(); };
+    audio.play().catch(()=>{ advTimer=setTimeout(()=>{if(i===n)next();},fallbackMs); });
+  }else{
+    advTimer=setTimeout(()=>{if(i===n)next();},fallbackMs);
+  }
+}
+function next(){ if(i<SCENES.length-1) show(i+1); else end(); }
+function end(){ playing=false; $("#replay").style.display=""; $("#hint").style.display="none"; clearTimers(); }
+function start(){ if(playing)return; started=true; playing=true; $("#replay").style.display="none"; $("#hint").textContent="space to skip a line"; show(0); }
+
+$("#replay").onclick=()=>{ i=-1; pdots.forEach(d=>d.classList.remove("done")); start(); };
+$("#mute").onclick=()=>{ voiceOn=!voiceOn; $("#mute").textContent=voiceOn?"🔊 Voice on":"🔈 Captions only";
+  if(!voiceOn&&audio){audio.pause();audio=null;} };
+document.body.addEventListener("click",e=>{ if(e.target.closest("button"))return; if(!started)start(); });
+document.addEventListener("keydown",e=>{ if(e.code==="Space"){e.preventDefault(); if(!started){start();}else{clearTimers();next();}} });
+</script>
+</body>
+</html>

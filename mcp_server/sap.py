@@ -737,21 +737,58 @@ _GET_MATERIAL_LEAN_FIELDS = (
 )
 
 
-@mcp.tool()
-def get_material(material_id: str, full: bool = False) -> str:
-    """Fetch a single material/product master record by ID from SAP S/4HANA.
+# Product-master VIEWS beyond the A_Product HEADER. SAP splits the master across navigation sub-entities:
+# the header carries CROSS-PLANT fields ONLY -- MRPType/ProcurementType/MRP-controller, tax, sales, price,
+# units etc. each live one navigation level deeper. Name a segment -> get_material $expands it. This is
+# EXACTLY why a header read can never show MRP/tax/sales: they are not header fields. Raw nav props also work.
+_PRODUCT_SEGMENTS = {
+    "plant": "to_Plant",                               # plant view -- MRPType/ProcurementType/MRPResponsible live HERE
+    "mrp": "to_Plant/to_ProductSupplyPlanning",        # MRP view (nested under the plant)
+    "workscheduling": "to_Plant/to_ProductWorkScheduling",
+    "storage": "to_Plant/to_StorageLocation",
+    "sales": "to_SalesDelivery",                       # sales-org / distribution data
+    "tax": "to_ProductSalesTax",                       # tax category + classification per country
+    "valuation": "to_Valuation", "price": "to_Valuation", "cost": "to_Valuation",  # standard price / val class
+    "procurement": "to_ProductProcurement",
+    "units": "to_ProductUnitsOfMeasure", "uom": "to_ProductUnitsOfMeasure",
+    "description": "to_Description", "text": "to_Description",
+}
 
-    Returns a LEAN set of the most-used header fields by default, so reading many
-    materials in one turn (e.g. extending a BOM's components to a plant) stays well
-    within the model's context window. Pass full=True only when you need a header
-    field outside the lean set (use find_field/list_fields to discover field names).
+
+@mcp.tool()
+def get_material(material_id: str, full: bool = False, segments=None, plant: str = "") -> str:
+    """Fetch a material/product master record by ID from SAP S/4HANA.
+
+    The master is SPLIT across VIEWS. The A_Product HEADER holds CROSS-PLANT fields ONLY -- MRPType,
+    ProcurementType, MRP controller, tax, sales, standard price etc. do NOT exist on the header; they
+    live on navigation sub-entities. That is why a plain header read can never show them. Name the
+    view(s) you need in `segments` and they are $expanded in -- one tool for every view.
 
     Args:
-        material_id: The exact material/product number, e.g. "21".
-        full: True -> the complete entity (every header field). Default False (lean).
+        material_id: the exact material/product number, e.g. "21".
+        full: True -> every HEADER field (still header-only). Default lean (most-used header fields).
+        segments: optional list of VIEWS to include beyond the header -- any of: plant, mrp,
+                  workscheduling, storage, sales, tax, valuation (a.k.a. price/cost), procurement,
+                  units, description. A raw SAP navigation property (e.g. "to_Valuation") also works
+                  for any view not in that list.
+        plant: optional -- filter the plant-scoped views (plant/mrp/storage/workscheduling) to this plant.
     """
+    url = f"/sap/opu/odata/sap/API_PRODUCT_SRV/A_Product('{material_id}')"
+    if segments:                                       # a VIEW read: $expand the named navigation sub-entities
+        navs = [_PRODUCT_SEGMENTS.get(str(s).lower().strip(), str(s).strip()) for s in segments]
+        raw = _sap_get(url, {"$expand": ",".join(dict.fromkeys(navs))})    # de-dup, preserve order
+        if raw.startswith("SAP request failed") or not plant:
+            return raw
+        try:                                           # narrow the plant-scoped view to the asked plant
+            d = json.loads(raw).get("d", {}) or {}
+            pv = d.get("to_Plant")
+            if isinstance(pv, dict) and isinstance(pv.get("results"), list):
+                pv["results"] = [r for r in pv["results"] if str(r.get("Plant")) == str(plant)]
+            return json.dumps({"d": d})
+        except (ValueError, TypeError, AttributeError):
+            return raw
     # Single-entity read by key — no $top (invalid on a single entity)
-    raw = _sap_get(f"/sap/opu/odata/sap/API_PRODUCT_SRV/A_Product('{material_id}')")
+    raw = _sap_get(url)
     if full or raw.startswith("SAP request failed"):
         return raw
     try:                                          # prune to the lean set; never break a read
@@ -759,7 +796,8 @@ def get_material(material_id: str, full: bool = False) -> str:
         lean = {k: d[k] for k in _GET_MATERIAL_LEAN_FIELDS if k in d}
         if not lean:                              # unexpected shape -> return raw untouched
             return raw
-        lean["_note"] = "lean view -- call get_material(id, full=true) for all header fields"
+        lean["_note"] = ("lean header -- get_material(id, full=true) for all header fields; "
+                         "segments=['mrp','tax','sales','valuation',...] for other views")
         return json.dumps({"d": lean})
     except (ValueError, TypeError, AttributeError):
         return raw
@@ -785,15 +823,36 @@ _PRODUCT_SRV = f"{SAP_BASE_URL}/sap/opu/odata/sap/API_PRODUCT_SRV"
 
 def _csrf_for(service_root: str) -> str:
     """Fetch a CSRF token (+ session cookies) from a service root on the shared session.
-    OData v2 rejects any write without it; the SAME sap_session is reused for the write."""
-    resp = sap_session.get(
-        f"{service_root}/",
-        params={"sap-client": SAP_CLIENT},
-        auth=(SAP_USER, SAP_PASS),
-        headers={"X-CSRF-Token": "Fetch", "Accept": "application/json"},
-        timeout=120, verify=False,
-    )
-    return resp.headers.get("x-csrf-token", "")
+    OData v2 rejects any write without it; the SAME sap_session is reused for the write.
+
+    SELF-HEAL: a write session can expire while it sits idle (e.g. between a preview and the user's
+    'go ahead'). When that happens SAP returns NO token and the write would be blocked. So if the fetch
+    comes back empty, drop the (stale) session cookies and re-fetch once on a fresh handshake -- the
+    commit recovers instead of failing with a CSRF error."""
+    def _fetch(path: str) -> str:
+        try:
+            resp = sap_session.get(
+                f"{service_root}{path}",
+                params={"sap-client": SAP_CLIENT},
+                auth=(SAP_USER, SAP_PASS),
+                headers={"X-CSRF-Token": "Fetch", "Accept": "application/json"},
+                timeout=120, verify=False,
+            )
+            tok = resp.headers.get("x-csrf-token", "")
+            return "" if tok.lower() in ("", "required", "fetch") else tok
+        except Exception:                        # noqa: BLE001 -- transient -> caller falls back / retries
+            return ""
+
+    # Some S/4 systems issue the token on /$metadata but NOT on the bare service root (the cause of the
+    # "CSRF token fetch failed" block in 0f08bac6 even though reads worked). Try $metadata first, then the
+    # root; if both come back empty, drop the (stale) cookies and retry the whole handshake once.
+    for _ in range(2):
+        for path in ("/$metadata", "/"):
+            token = _fetch(path)
+            if token:
+                return token
+        sap_session.cookies.clear()
+    return ""
 
 
 def _sap_csrf_token() -> str:
@@ -1058,13 +1117,20 @@ def create_material(fields: dict, confirm: bool = False) -> str:
     token = _sap_csrf_token()
     if not token:
         return "Could not obtain a CSRF token from SAP (write blocked)."
-    try:
-        resp = sap_session.post(
+
+    def _do_post(tok):
+        return sap_session.post(
             url, params={"sap-client": SAP_CLIENT}, auth=(SAP_USER, SAP_PASS),
-            headers={"X-CSRF-Token": token, "Content-Type": "application/json",
+            headers={"X-CSRF-Token": tok, "Content-Type": "application/json",
                      "Accept": "application/json"},
             json=fields, timeout=120, verify=False,
         )
+
+    try:
+        resp = _do_post(token)
+        if resp.status_code == 403 and "csrf" in (resp.headers.get("x-csrf-token", "") + (resp.text or "")).lower():
+            token = _sap_csrf_token()            # token was rejected -> re-fetch fresh and retry once
+            resp = _do_post(token)
         resp.raise_for_status()
         return f"Created material (HTTP {resp.status_code}): {resp.text[:600]}"
     except requests.exceptions.RequestException as e:
@@ -1207,6 +1273,64 @@ def change_material_view(entity: str, keys: dict, fields: dict | None = None,
     except requests.exceptions.RequestException as e:
         detail = e.response.text[:600] if getattr(e, "response", None) is not None else ""
         return f"{op} on {entity} failed: {e}\n{detail}"
+
+
+# ---- typed UPDATE / soft-DELETE tools, one per in-scope object ------------------------------------
+# Every object the agent CREATES it must also be able to CHANGE -- otherwise the platform is a one-shot
+# creator, not an operator (e.g. a PIR's supplier/lead-time/min-max changes; a routing operation moves
+# to a different work center; a condition is re-priced; a BOM item qty changes; a material is retired).
+# Each tool below is a thin, typed facade over change_material_view (the generic OData add/update/delete
+# engine above) with its object's SERVICE + a sensible default child ENTITY -- so the agent gets a clear
+# named UPDATE per object without a separate engine each. "delete" = SAP SOFT delete (the deletion
+# flag / mark-for-deletion); real archival is a separate process and out of scope.
+# Discover the exact key + fields first with explore_entity / list_fields; never guess them.
+def change_material(entity: str = "A_Product", keys: dict | None = None, fields: dict | None = None,
+                    operation: str = "update", confirm: bool = False) -> str:
+    """UPDATE a MATERIAL or mark it for deletion (API_PRODUCT_SRV). operation='update' PATCHes the keyed
+    row; 'add' extends a view; 'delete' removes it. For a SOFT delete, 'update' the deletion flag on the
+    relevant entity (e.g. set MarkedForDeletion on A_ProductPlant). Discover the key with explore_entity.
+    Preview-gated (confirm=false)."""
+    return change_material_view(entity, keys or {}, fields, operation,
+                                service="API_PRODUCT_SRV", confirm=confirm)
+
+
+def change_routing(entity: str = "ProductionRoutingOperation", keys: dict | None = None,
+                   fields: dict | None = None, operation: str = "update", confirm: bool = False) -> str:
+    """UPDATE a ROUTING (API_PRODUCTION_ROUTING) -- e.g. repoint an operation's WorkCenter, change its
+    text or times. keys = the FULL key of the ProductionRoutingOperation row (get it from get_routing /
+    explore_entity). fields = {WorkCenter: '<code>', ...}. operation 'update'|'add'|'delete'.
+    Preview-gated (confirm=false)."""
+    return change_material_view(entity, keys or {}, fields, operation,
+                                service="API_PRODUCTION_ROUTING", confirm=confirm)
+
+
+def change_pir(entity: str = "A_PurgInfoRecdOrgPlantData", keys: dict | None = None,
+               fields: dict | None = None, operation: str = "update", confirm: bool = False) -> str:
+    """UPDATE a Purchasing Info Record (API_INFORECORD_PROCESS_SRV) -- e.g. a supplier's planned delivery
+    time, min/max/standard quantity, net price terms. keys = the FULL key (from read_pir / explore_entity);
+    fields = {MaterialPlannedDeliveryDurationInDays: '5', ...}. operation 'update'|'add'|'delete'.
+    Preview-gated (confirm=false)."""
+    return change_material_view(entity, keys or {}, fields, operation,
+                                service="API_INFORECORD_PROCESS_SRV", confirm=confirm)
+
+
+def change_cost_condition(entity: str = "A_PurgPrcgConditionRecord", keys: dict | None = None,
+                          fields: dict | None = None, operation: str = "update", confirm: bool = False) -> str:
+    """UPDATE a purchasing price/cost CONDITION record (API_PURGPRCGCONDITIONRECORD_SRV) -- e.g. a new
+    agreed net price or validity. keys = the FULL key (from explore_entity); fields = {ConditionRateValue:
+    '12.50', ...}. Some condition values live IN the key -> change those by delete + add. operation
+    'update'|'add'|'delete'. Preview-gated (confirm=false)."""
+    return change_material_view(entity, keys or {}, fields, operation,
+                                service="API_PURGPRCGCONDITIONRECORD_SRV", confirm=confirm)
+
+
+def change_bom(entity: str = "MaterialBOMItem", keys: dict | None = None, fields: dict | None = None,
+               operation: str = "update", confirm: bool = False) -> str:
+    """UPDATE a BOM item (API_BILL_OF_MATERIAL_SRV) -- e.g. change a component quantity, or 'delete' a
+    line. keys = the FULL key of the MaterialBOMItem (from get_bom / explore_entity); fields =
+    {BillOfMaterialItemQuantity: '2', ...}. operation 'update'|'add'|'delete'. Preview-gated."""
+    return change_material_view(entity, keys or {}, fields, operation,
+                                service="API_BILL_OF_MATERIAL_SRV", confirm=confirm)
 
 
 # Valuation AREA local currency (a plant->currency RELATION, not the create currency).

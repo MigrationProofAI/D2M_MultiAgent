@@ -12,10 +12,18 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "mcp_server"))
 from sap import (get_material, search_materials, create_material, update_material,   # noqa: E402
-                 build_material_payload, list_allowed_values, find_field, extend_to_plant)
-from genesis import run_genesis, enable_plant_production   # noqa: E402  -- Design2Make orchestration + one-call plant enablement
-from make import (get_bom, add_bom_component, remove_bom_component, create_bom)  # noqa: E402  -- post-genesis BOM edits
-from planning_client import create_demand, run_mrp   # noqa: E402  -- SSE bridge to the NWRFC planning server (:8001)
+                 build_material_payload, list_allowed_values, find_field, extend_to_plant,
+                 change_material, change_routing, change_pir,            # noqa: E402  -- typed UPDATE/soft-delete
+                 change_cost_condition, change_bom)                      # noqa: E402     (one per in-scope object)
+from genesis import (run_genesis, enable_plant_production,   # noqa: E402  -- Design2Make orchestration + one-call plant enablement
+                     read_production_version, read_routing)  # noqa: E402  -- :8002 RFC reads (MKAL / MAPL)
+from make import (get_bom, add_bom_component, remove_bom_component, create_bom,   # noqa: E402  -- post-genesis BOM edits
+                  read_pir, create_info_record, create_cost_condition,  # noqa: E402  -- PIR + cost (bought path)
+                  find_work_center, get_routing, set_routing_operation,  # noqa: E402  -- routing read + WC repoint
+                  set_supplier_terms,                                    # noqa: E402  -- PIR price/lead/min correction
+                  read_cost_condition, set_condition_price)              # noqa: E402  -- cost price read + correct
+from planning_client import (create_demand, read_demand, run_mrp,   # noqa: E402  -- PIR demand (:8003) + MRP run (:8001)
+                             read_mrp_list, read_mrp_material)       # noqa: E402  -- MD04 read (mcp-mrp :8004)
 from serper import google_search           # noqa: E402  -- web search for prices / specs
 from config_graph import (get_valid_storage_locations, get_valid_mrp_controllers,   # noqa: E402
                           refresh_relationship)        # plant-keyed config (T001L / T024D), not in the codebook
@@ -153,9 +161,18 @@ def _render_card(title="", content="", subtitle=""):
 # name -> (callable, OpenAI tool spec). The substance kept from D2M; the ceremony (MCP/ADK) dropped.
 TOOLS = {
     "get_material": (get_material, _spec(
-        "get_material", "Read a material/product master by ID from SAP S/4HANA.",
+        "get_material", "Read a material/product master by ID from SAP S/4HANA. The HEADER holds "
+        "CROSS-PLANT fields ONLY — MRPType, ProcurementType, MRP controller, tax, sales, standard price "
+        "etc. are NOT header fields; they live on plant/sales/tax/valuation VIEWS. Use `segments` to pull "
+        "any view: e.g. segments=['mrp'] for MRPType/ProcurementType/MRPResponsible, ['tax'], ['sales'], "
+        "['valuation'] for standard price. Pass `plant` to scope plant views.",
         {"material_id": {"type": "string", "description": "exact material number"},
-         "full": {"type": "boolean", "description": "true = all header fields"}}, ["material_id"])),
+         "full": {"type": "boolean", "description": "true = all header fields"},
+         "segments": {"type": "array", "items": {"type": "string"},
+                      "description": "views to include: plant, mrp, workscheduling, storage, sales, tax, "
+                                     "valuation (price/cost), procurement, units, description (or a raw to_* nav prop)"},
+         "plant": {"type": "string", "description": "filter plant-scoped views to this plant"}},
+        ["material_id"])),
 
     "build_material_payload": (build_material_payload, _spec(
         "build_material_payload",
@@ -187,6 +204,120 @@ TOOLS = {
          "fields": {"type": "object", "description": "{ExactODataFieldName: new_value}, e.g. {\"CountryOfOrigin\":\"US\"}"},
          "confirm": {"type": "boolean"}}, ["material_id", "fields"])),
 
+    # ---- typed UPDATE / soft-delete, one per in-scope object (full CRUD versatility) -------------
+    # Each PATCHes (or add/delete) the keyed CHILD row on the object's own OData service. Workflow:
+    # discover the exact KEY + field with explore_entity/list_fields/get_*; then change_*(keys, fields).
+    # "delete" = SAP soft delete (deletion flag); real archival is out of scope.
+    "set_routing_operation": (set_routing_operation, _spec(
+        "set_routing_operation", "Repoint a routing OPERATION to a different WORK CENTER — the common "
+        "routing edit. USE THIS for 'change the work center of operation 10 to TECHNIC'. Give just "
+        "material + operation NUMBER + work-center code/name; it resolves the routing group, the "
+        "operation's internal OData key, and the WorkCenterInternalID for you (do NOT hand-build routing "
+        "keys — that fails). confirm=false PREVIEWS; confirm=true COMMITS.",
+        {"material": {"type": "string", "description": "the made material whose routing to edit"},
+         "operation": {"type": "string", "description": "operation NUMBER from get_routing, e.g. '10'"},
+         "work_center": {"type": "string", "description": "target work-center code/name, e.g. 'TECHNIC'"},
+         "plant": {"type": "string", "description": "default system plant"},
+         "confirm": {"type": "boolean"}}, ["material", "operation", "work_center"])),
+
+    "get_routing": (get_routing, _spec(
+        "get_routing", "READ the routing (operation sequence + each operation's work center) for a "
+        "MATERIAL. Use to show/inspect a routing before editing it with set_routing_operation.",
+        {"material": {"type": "string"}, "plant": {"type": "string"}}, ["material"])),
+
+    "change_routing": (change_routing, _spec(
+        "change_routing", "ADVANCED generic UPDATE of a ROUTING row (API_PRODUCTION_ROUTING). For the "
+        "common case of moving an operation to a different work center, prefer set_routing_operation — it "
+        "resolves the key for you. Use change_routing only for other fields, and ONLY with the EXACT "
+        "ProductionRoutingOperation key (ProductionRoutingGroup, ProductionRouting, ProductionRoutingSequence, "
+        "ProductionRoutingOpIntID, ProductionRoutingOpIntVersion) read from explore_entity — the op NUMBER "
+        "is NOT the OpIntID. The work center field is WorkCenterInternalID (an id), not WorkCenter. "
+        "confirm=false PREVIEWS; confirm=true COMMITS.",
+        {"entity": {"type": "string", "description": "default ProductionRoutingOperation"},
+         "keys": {"type": "object", "description": "FULL internal key (from explore_entity)"},
+         "fields": {"type": "object", "description": "{ExactODataField: new_value}, e.g. {\"WorkCenterInternalID\":\"10000010\"}"},
+         "operation": {"type": "string", "description": "'update' (default), 'add', or 'delete'"},
+         "confirm": {"type": "boolean"}}, ["keys"])),
+
+    "set_supplier_terms": (set_supplier_terms, _spec(
+        "set_supplier_terms", "Attempt to correct an EXISTING Purchase Info Record's TERMS — net price, "
+        "planned delivery (lead) time, min order qty — by MATERIAL (+ optional supplier). Resolves the "
+        "PIR's full key for you and VERIFIES after writing. NOTE: on this S/4 system the info-record OData "
+        "API accepts the request (HTTP 204) but IGNORES these field updates — they are effectively set at "
+        "CREATION only; the tool will tell you if SAP did not apply them. The PIR net price's real lever is "
+        "the PB00 cost CONDITION (change_cost_condition), and prices are best set right at create (genesis "
+        "now passes the price). Pass only the field(s) to change. confirm=false PREVIEWS; confirm=true COMMITS.",
+        {"material": {"type": "string", "description": "the bought material the PIR is for"},
+         "supplier": {"type": "string", "description": "optional; needed if the material has several PIRs"},
+         "net_price": {"type": "number", "description": "new net price, e.g. 7.12"},
+         "lead_time_days": {"type": "integer", "description": "new planned delivery time (days)"},
+         "min_order_qty": {"type": "number", "description": "new minimum order quantity"},
+         "plant": {"type": "string", "description": "default system plant"},
+         "confirm": {"type": "boolean"}}, ["material"])),
+
+    "change_pir": (change_pir, _spec(
+        "change_pir", "ADVANCED generic UPDATE of a Purchasing Info Record row (API_INFORECORD_PROCESS_SRV). "
+        "For the common case of fixing price/lead-time/min-qty, prefer set_supplier_terms — it resolves the "
+        "key for you. Use change_pir only for other fields, with the EXACT A_PurgInfoRecdOrgPlantData key: "
+        "PurchasingInfoRecord, PurchasingInfoRecordCategory ('0'), PurchasingOrganization, Plant (all four — "
+        "get them from read_pir/explore_entity). Price field = NetPriceAmount; currency = Currency. "
+        "operation 'update'|'add'|'delete'. confirm=false PREVIEWS; confirm=true COMMITS.",
+        {"entity": {"type": "string", "description": "default A_PurgInfoRecdOrgPlantData"},
+         "keys": {"type": "object", "description": "FULL 4-part key (see description)"},
+         "fields": {"type": "object", "description": "e.g. {\"NetPriceAmount\":\"7.12\"}"},
+         "operation": {"type": "string", "description": "'update' (default), 'add', or 'delete'"},
+         "confirm": {"type": "boolean"}}, ["keys"])),
+
+    "read_cost_condition": (read_cost_condition, _spec(
+        "read_cost_condition", "READ the purchasing price CONDITION(s) (PPR0) for a material (+ optional "
+        "supplier): record number, rate (the actual price MRP/POs use), currency, validity. Use to verify "
+        "a price or before correcting it. Multiple records can exist (repeated genesis runs).",
+        {"material": {"type": "string"}, "supplier": {"type": "string", "description": "optional"}}, ["material"])),
+
+    "set_condition_price": (set_condition_price, _spec(
+        "set_condition_price", "Correct the PRICE on an existing purchasing price CONDITION — the REAL "
+        "lever for what MRP/POs pay (the PIR's NetPriceAmount field is not updatable; this is). Give "
+        "material + new price (+ optional supplier); it resolves the condition record and PATCHes its "
+        "rate, verifying after. If several conditions exist, pass condition_record to target one. "
+        "confirm=false PREVIEWS; confirm=true COMMITS.",
+        {"material": {"type": "string"}, "price": {"type": "number", "description": "new condition rate, e.g. 7.12"},
+         "supplier": {"type": "string", "description": "optional"},
+         "condition_record": {"type": "string", "description": "optional exact ConditionRecord to target"},
+         "confirm": {"type": "boolean"}}, ["material", "price"])),
+
+    "change_cost_condition": (change_cost_condition, _spec(
+        "change_cost_condition", "UPDATE a purchasing price/cost CONDITION record "
+        "(API_PURGPRCGCONDITIONRECORD_SRV) — e.g. a newly agreed net price or validity. keys = the FULL "
+        "key (from explore_entity); fields = {\"ConditionRateValue\":\"12.50\"}. NOTE some condition "
+        "values live IN the key — change those by delete + add. operation 'update'|'add'|'delete'. "
+        "confirm=false PREVIEWS; confirm=true COMMITS.",
+        {"entity": {"type": "string", "description": "default A_PurgPrcgConditionRecord"},
+         "keys": {"type": "object"}, "fields": {"type": "object"},
+         "operation": {"type": "string", "description": "'update' (default), 'add', or 'delete'"},
+         "confirm": {"type": "boolean"}}, ["keys"])),
+
+    "change_bom": (change_bom, _spec(
+        "change_bom", "UPDATE a BOM item (API_BILL_OF_MATERIAL_SRV) — e.g. change a component quantity, "
+        "or 'delete' a line. keys = the FULL MaterialBOMItem key (from get_bom/explore_entity); fields = "
+        "{\"BillOfMaterialItemQuantity\":\"2\"}. operation 'update'|'add'|'delete'. confirm=false "
+        "PREVIEWS; confirm=true COMMITS. (To add/remove a component you may also use "
+        "add_bom_component/remove_bom_component.)",
+        {"entity": {"type": "string", "description": "default MaterialBOMItem"},
+         "keys": {"type": "object"}, "fields": {"type": "object"},
+         "operation": {"type": "string", "description": "'update' (default), 'add', or 'delete'"},
+         "confirm": {"type": "boolean"}}, ["keys"])),
+
+    "change_material": (change_material, _spec(
+        "change_material", "UPDATE a MATERIAL child entity or mark it for deletion (API_PRODUCT_SRV) — the "
+        "generic counterpart to update_material for NON-header views (plant, sales, valuation). For a SOFT "
+        "delete, 'update' the deletion flag on the right entity (e.g. set the marked-for-deletion field on "
+        "A_ProductPlant). keys = the FULL key (from explore_entity); operation 'update'|'add'|'delete'. "
+        "For a simple header field change prefer update_material. confirm=false PREVIEWS; confirm=true COMMITS.",
+        {"entity": {"type": "string", "description": "default A_Product; e.g. A_ProductPlant for soft-delete"},
+         "keys": {"type": "object"}, "fields": {"type": "object"},
+         "operation": {"type": "string", "description": "'update' (default), 'add', or 'delete'"},
+         "confirm": {"type": "boolean"}}, ["keys"])),
+
     "extend_to_plant": (extend_to_plant, _spec(
         "extend_to_plant", "LOW-LEVEL: extend ONE single material's plant + valuation views to a new plant "
         "— one material only, NO BOM / routing / production version / components. To extend a whole ASSEMBLY "
@@ -216,6 +347,16 @@ TOOLS = {
         "planning MRP type (e.g. PD) REQUIRES an MRP controller; ground it from this list — never guess or omit it.",
         {"plant": {"type": "string", "description": "plant code, e.g. 1010"}}, ["plant"])),
 
+    "find_work_center": (find_work_center, _spec(
+        "find_work_center", "LIST or resolve the work centers at a plant. Work centers are master-data "
+        "objects (CR03), NOT a codebook field — so to LIST every work center for a plant, call this with a "
+        "blank or generic query (e.g. query='') and it returns all of them (code + internal id + "
+        "description). To RESOLVE one, pass a code/name/alias ('PACK01', 'packaging', 'assembly') and it "
+        "returns the SAP internal id needed by create_routing. Backed by a map verified from live routing "
+        "operations (mcp_server/work_centers.json).",
+        {"query": {"type": "string", "description": "work-center code/name/alias to resolve; blank '' = list ALL for the plant"},
+         "plant": {"type": "string", "description": "plant code, default 1710"}}, ["query"])),
+
     "refresh_relationship": (refresh_relationship, _spec(
         "refresh_relationship", "Re-read a plant-keyed config relationship from SAP (clears the cache); "
         "use after a governed config change. relationship: 'storage_location' | 'mrp_controller'.",
@@ -232,7 +373,8 @@ TOOLS = {
         "call the individual create tools -- run_genesis owns the whole write chain.",
         {"spec": {"type": "object", "description": "{parent:{description,type}, components:[{name,description,"
                   "type(HAWA/HALB/FERT),role(bought/made),vendor,price,quantity}], routing?:[{operation,text,work_center}], "
-                  "dedup?:bool (default true; false = force a FRESH build, no reuse)}"},
+                  "dedup?:bool (OPTIONAL — leave it OUT. The rig controls reuse via GENESIS_DEDUP, "
+                  "currently OFF = always create fresh, never reuse old materials. Do not set this true.)}"},
          "confirm": {"type": "boolean"}}, ["spec"])),
 
     "enable_plant_production": (enable_plant_production, _spec(
@@ -283,15 +425,68 @@ TOOLS = {
                         "description": "[{component, quantity, unit?, item_category?}]"},
          "confirm": {"type": "boolean"}}, ["material", "plant", "components"])),
 
+    "read_production_version": (read_production_version, _spec(
+        "read_production_version", "READ the production version(s) for a MADE material (FERT/HALB) at a "
+        "plant, from table MKAL. Returns each version + the BOM it binds (alt/usage). Empty (count 0) = "
+        "NO production version exists yet — a gap; every made material needs one.",
+        {"material": {"type": "string", "description": "the made material (FERT or HALB)"},
+         "plant": {"type": "string", "description": "plant, e.g. 1710"}}, ["material"])),
+
+    "read_routing": (read_routing, _spec(
+        "read_routing", "READ the routing(s) assigned to a MADE material (FERT/HALB) at a plant, from "
+        "table MAPL. Returns each routing group/counter. Empty (count 0) = NO routing exists yet — a "
+        "gap; every made material needs its own routing.",
+        {"material": {"type": "string", "description": "the made material (FERT or HALB)"},
+         "plant": {"type": "string", "description": "plant, e.g. 1710"}}, ["material"])),
+
+    "read_pir": (read_pir, _spec(
+        "read_pir", "READ the Purchase Info Record(s) for a MATERIAL (a bought-out / HAWA component): "
+        "each supplier's net price, currency, lead time and min order qty. Use to CONFIRM a bought "
+        "component actually HAS a PIR with a committed price. If it returns no record, the material has "
+        "NO PIR yet (a gap). A material number is NOT a PIR number.",
+        {"material": {"type": "string", "description": "the bought component's material number"},
+         "supplier": {"type": "string", "description": "optional supplier/vendor filter"}}, ["material"])),
+
+    "create_info_record": (create_info_record, _spec(
+        "create_info_record", "Create a Purchase Info Record (PIR) for a BOUGHT component: links the "
+        "material to its supplier with a net price + lead time, so MRP can raise a purchase requisition. "
+        "Every HAWA/bought-out component needs one. confirm=false PREVIEWS; confirm=true COMMITS.",
+        {"material": {"type": "string"}, "supplier": {"type": "string", "description": "supplier/vendor code, e.g. 17300001"},
+         "net_price": {"type": "number", "description": "the component's net price"},
+         "currency": {"type": "string"}, "lead_time_days": {"type": "integer"},
+         "purchasing_org": {"type": "string", "description": "default 1710"},
+         "confirm": {"type": "boolean"}}, ["material", "supplier"])),
+
+    "create_cost_condition": (create_cost_condition, _spec(
+        "create_cost_condition", "Commit the purchasing PRICE condition (PPR0) for a bought "
+        "material/supplier — the actual cost price in SAP (optionally with qty price-breaks). Call after "
+        "create_info_record to write the (e.g. web-sourced) price, not leave it as a preview. "
+        "confirm=false PREVIEWS; confirm=true COMMITS.",
+        {"material": {"type": "string"}, "supplier": {"type": "string"},
+         "price": {"type": "number", "description": "the committed net price"},
+         "currency": {"type": "string"}, "purchasing_org": {"type": "string"},
+         "confirm": {"type": "boolean"}}, ["material", "supplier", "price"])),
+
     "create_demand": (create_demand, _spec(
-        "create_demand", "Create sales-order DEMAND for a finished good (each call adds a new order, so "
-        "demand accumulates). Runs on the remote NWRFC planning server. confirm=false PREVIEWS; "
-        "confirm=true COMMITS. If it returns an ERROR about reaching the server, the demand did NOT run — "
-        "say so; never claim success.",
+        "create_demand", "Create Planned Independent Requirements (forecast) DEMAND for a make-to-stock "
+        "finished good — type VSF/version 00 via API_PLND_INDEP_RQMT_SRV (the make-to-stock signal MRP "
+        "consumes, NOT a sales order). Runs on the remote mcp-demand server (:8003). For ONE month set "
+        "period (YYYYMM; default next month). For demand 'each month' across a SPAN, make a SINGLE call "
+        "with period=START YYYYMM and period_to=END YYYYMM (e.g. period=202607, period_to=202612 = "
+        "quantity each month Jul–Dec 2026) — do NOT call this tool once per month. confirm=false "
+        "PREVIEWS; confirm=true COMMITS. If it returns an ERROR about reaching the server, the demand "
+        "did NOT run — say so; never claim success.",
         {"material": {"type": "string", "description": "the finished-good material number"},
-         "plant": {"type": "string"}, "quantity": {"type": "string"},
-         "customer": {"type": "string", "description": "sold-to, default USCU_S03"},
+         "plant": {"type": "string"}, "quantity": {"type": "string", "description": "units per month"},
+         "period": {"type": "string", "description": "YYYYMM; default next month. START of the range if period_to is set"},
+         "period_to": {"type": "string", "description": "END YYYYMM; set with period to write one bucket per month across the span in ONE call"},
          "confirm": {"type": "boolean"}}, ["material"])),
+
+    "read_demand": (read_demand, _spec(
+        "read_demand", "READ existing Planned Independent Requirements (header + per-period quantities) "
+        "for a material+plant from API_PLND_INDEP_RQMT_SRV (mcp-demand :8003). Use to VERIFY that demand "
+        "actually persisted. An empty result means NO PIR demand exists yet for that material.",
+        {"material": {"type": "string"}, "plant": {"type": "string"}}, ["material"])),
 
     "run_mrp": (run_mrp, _spec(
         "run_mrp", "Run MRP for a material and return the planned cascade (planned orders + purchase reqs "
@@ -302,6 +497,23 @@ TOOLS = {
          "multi_level": {"type": "boolean"},
          "planning_mode": {"type": "string", "description": "'1'=adapt (normal), '3'=delete & recreate (demo)"},
          "confirm": {"type": "boolean"}}, ["material"])),
+
+    "read_mrp_list": (read_mrp_list, _spec(
+        "read_mrp_list", "READ the MD04 stock/requirements list for a material — every supply & demand "
+        "element the MRP run PRODUCED: plant stock, planned orders, purchase requisitions, planned "
+        "independent requirements, sales orders, dependent requirements — each with date, quantity and "
+        "running available quantity. This is how you VERIFY an MRP execution (e.g. demand is covered by a "
+        "planned order, components exploded into dependent reqs). Read-only (mcp-mrp :8004). 'No MRP "
+        "elements' means MRP has not produced anything yet for that material.",
+        {"material": {"type": "string"}, "plant": {"type": "string"},
+         "area": {"type": "string", "description": "MRP area; defaults to plant"}}, ["material"])),
+
+    "read_mrp_material": (read_mrp_material, _spec(
+        "read_mrp_material", "READ the MRP material master for a material @ plant: procurement type "
+        "(E in-house / F external), low-level code, base unit, material type/group, MRP area. Read-only "
+        "(mcp-mrp :8004).",
+        {"material": {"type": "string"}, "plant": {"type": "string"},
+         "area": {"type": "string", "description": "MRP area; defaults to plant"}}, ["material"])),
 
     "google_search": (google_search, _spec(
         "google_search", "Web search for prices, specs, weights, dimensions (e.g. 'ASUS ROG 16GB DDR5 price').",
@@ -344,6 +556,15 @@ TOOLS = {
         {"title": {"type": "string"}, "subtitle": {"type": "string"},
          "content": {"type": "string", "description": "the card body, HTML or Markdown"}}, ["title", "content"])),
 }
+
+# Optionally re-point SAP tools at the CLOUD MCP fleet instead of in-process OData (flag SAP_VIA_MCP).
+# No-op unless the flag is on, so the in-process path stays the default. Lets us migrate object-by-object
+# and retire the local :8001-:8004 once everything routes through the cloud mcp-* servers.
+try:
+    import mcp_route as _mcp_route                       # noqa: E402
+    TOOLS = _mcp_route.apply(TOOLS)
+except Exception as _e:                                  # never let routing wiring break the registry
+    pass
 
 TOOL_SPECS = [spec for _, spec in TOOLS.values()]
 

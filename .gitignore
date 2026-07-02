@@ -12,8 +12,14 @@ tts_cache/
 env.txt
 *.pem
 *.crt
+awsdetails.txt
+aws*.txt
+secrets.yml
+*_accessKeys.csv
+*accessKeys*.csv
 
 # build artifacts / regenerable data
+.s3sync.json
 vector_store/
 __pycache__/
 *.pyc
@@ -27,3 +33,8 @@ lessons.jsonl
 promotions.jsonl
 learning_ledger.jsonl
 logs/learning_events.jsonl
+
+# scratch / logs / backups -- transient, may leak SAP tokens or data
+scratch_*
+*.log
+static_v2.bak/

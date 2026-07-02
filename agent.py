@@ -10,7 +10,7 @@ import base64
 import json
 import os
 
-from model_client import model_complete
+from model_client import model_complete, turn_usage
 from tools import TOOL_SPECS, dispatch
 
 # Loop-breaker thresholds. The Nth identical (tool, args) call gets ONE advisory ("change approach");
@@ -73,15 +73,48 @@ def run_agent(system_instruction, user_input, history=None, tools=True, max_step
 
 
 def run_turn(memory, user_input, image=None, mime="image/png", tools=True, max_steps=8, verbose=True,
-             steps=None, perceive=False, model=None):
+             steps=None, perceive=False, model=None, allowed_tools=None, on_step=None, agent_label="agent"):
     """A MEMORY-AWARE turn (Step 2): add the user message (blobs evicted to disk), compact on the token
     budget, then run the loop against the COMPACTED context. Returns the final text; the transcript
     lives in `memory`. If `steps` is a list, tool_call/tool_result records are appended for the UI.
     perceive=True shows the image to the vision model THIS turn (genesis) -- it is still evicted to
-    disk, so it never rides in subsequent turns."""
+    disk, so it never rides in subsequent turns.
+
+    allowed_tools: AUTHORITY ENFORCEMENT (least privilege). None = unrestricted (default; behaviour is
+    unchanged). A set/list of tool NAMES = this agent may ONLY see and call those tools; any other tool
+    call is DENIED at dispatch (not executed) and the model is told so. This is how a Skill binds a
+    least-privilege subset -- e.g. a read-only Verifier that structurally CANNOT write."""
     memory.add_user(user_input, image=image, mime=mime)
     memory.maybe_compact()                          # token-budget compaction BEFORE the model sees it
-    specs = TOOL_SPECS if tools else None
+    turn_usage(reset=True)                           # start token accounting fresh for this turn/thread
+    try:
+        import mcp_route as _mr
+        _mr.turn_mcp_calls(reset=True)               # reset per-server MCP call counts for this turn
+    except Exception:
+        pass
+
+    def _emit_usage():                               # TELEMETRY: this agent-turn's tokens + MCP calls -> chain
+        if on_step is None:
+            return
+        u = turn_usage()
+        try:
+            import mcp_route as _mr
+            m = _mr.turn_mcp_calls()
+            if m:
+                u["mcp"] = m                          # servers hit INSIDE run_genesis (create_* -> mcp-*)
+        except Exception:
+            pass
+        try:
+            on_step({"kind": "usage", **u})
+        except Exception:
+            pass
+    if not tools:
+        specs = None
+    elif allowed_tools is not None:                 # show the model ONLY the tools its authority allows
+        allow = set(allowed_tools)
+        specs = [s for s in TOOL_SPECS if s["function"]["name"] in allow]
+    else:
+        specs = TOOL_SPECS
     vision = image if (perceive and image) else None
     last_text = ""                                  # remember the latest narration for a graceful cap-hit
     call_counts = {}                                # loop-breaker: (tool, args) -> times called this turn
@@ -94,7 +127,14 @@ def run_turn(memory, user_input, image=None, mime="image/png", tools=True, max_s
         msg = model_complete(msgs, tools=specs, model=model)
         if msg.content:
             last_text = msg.content
+        if on_step is not None and getattr(msg, "reasoning", None):
+            try:
+                on_step({"kind": "reasoning", "text": msg.reasoning})   # the model's chain-of-thought
+            except Exception:
+                pass
         assistant = {"role": "assistant", "content": msg.content or ""}
+        if getattr(msg, "thinking_blocks", None):
+            assistant["_thinking"] = msg.thinking_blocks   # round-trip the signed thinking blocks
         if msg.tool_calls:
             assistant["tool_calls"] = [
                 {"id": tc.id, "type": "function",
@@ -102,6 +142,7 @@ def run_turn(memory, user_input, image=None, mime="image/png", tools=True, max_s
                 for tc in msg.tool_calls]
         memory.add_assistant(assistant)
         if not msg.tool_calls:
+            _emit_usage()
             return msg.content or ""
         for idx, tc in enumerate(msg.tool_calls):
             name = tc.function.name
@@ -112,7 +153,22 @@ def run_turn(memory, user_input, image=None, mime="image/png", tools=True, max_s
             if verbose:
                 print(f"   -> {name}({json.dumps(args)[:120]})")
             if steps is not None:
-                steps.append({"author": "agent", "kind": "tool_call", "tool": name, "args": args})
+                steps.append({"author": agent_label, "kind": "tool_call", "tool": name, "args": args})
+            if on_step is not None:                  # live progress narration (status line + activity feed)
+                try:
+                    on_step({"kind": "tool", "tool": name, "args": args})
+                except Exception:
+                    pass                             # a narration hiccup must never break the turn
+            if allowed_tools is not None and name not in set(allowed_tools):
+                # AUTHORITY: the model asked for a tool outside this agent's least-privilege subset.
+                # Refuse it (do NOT dispatch) and tell the model -- a read-only agent CANNOT write.
+                denial = (f"DENIED: '{name}' is outside this agent's authority. Allowed tools: "
+                          f"{sorted(set(allowed_tools))}. Your Skill binds a least-privilege subset -- "
+                          f"do not attempt this again; work within your authority or report the blocker.")
+                memory.add_tool(tc.id, denial)
+                if steps is not None:
+                    steps.append({"author": agent_label, "kind": "tool_result", "tool": name, "result": denial})
+                continue
             sig = name + "|" + json.dumps(args, sort_keys=True)[:300]
             call_counts[sig] = call_counts.get(sig, 0) + 1
             n = call_counts[sig]
@@ -126,7 +182,7 @@ def run_turn(memory, user_input, image=None, mime="image/png", tools=True, max_s
                 for other in msg.tool_calls[idx + 1:]:
                     memory.add_tool(other.id, "(skipped -- turn stopped by the loop breaker)")
                 if steps is not None:
-                    steps.append({"author": "agent", "kind": "tool_result", "tool": name, "result": blocker})
+                    steps.append({"author": agent_label, "kind": "tool_result", "tool": name, "result": blocker})
                 stop = (f"_(Stopped — I kept calling `{name}` with the same arguments and stopped making "
                         f"progress; the result wasn't changing, so retrying won't help. Tell me how you'd "
                         f"like to proceed, or I can try a different approach.)_")
@@ -140,6 +196,7 @@ def run_turn(memory, user_input, image=None, mime="image/png", tools=True, max_s
                 result = dispatch(name, args)
             memory.add_tool(tc.id, result)
             if steps is not None:
-                steps.append({"author": "agent", "kind": "tool_result", "tool": name, "result": str(result)[:8000]})
+                steps.append({"author": agent_label, "kind": "tool_result", "tool": name, "result": str(result)[:8000]})
     tail = "_(Paused at the step limit — I was still mid-task. Say \"continue\" to resume.)_"
+    _emit_usage()
     return (last_text + "\n\n" + tail) if last_text else tail

@@ -38,3 +38,6 @@ logs/learning_events.jsonl
 scratch_*
 *.log
 static_v2.bak/
+
+# generated BOM fixtures (regenerable via gen_bom_fixture.py)
+bom_*.xlsx

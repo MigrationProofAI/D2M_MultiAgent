@@ -367,6 +367,16 @@ def _build_made_subassembly(c: dict, plant: str, sp, report: list, created_raws:
             ch["material"] = cmat
         else:
             report.append(f"      raw {ch.get('name')}: exists {cmat}")
+        # Source bought raws at THIS sub-assembly level too -- PIR + cost, mirroring the top-level
+        # component block (~line 619). Closes the gap where a nested bought raw was created but never
+        # sourced (no PIR/cost), so a multi-layer BOM is sourced everywhere a bought part sits.
+        if ch.get("role") == "bought" and ch.get("vendor") and cmat:
+            _rp = float(ch["price"]) if ch.get("price") not in (None, "") else 0.01
+            _rpir = _plain(create_info_record(cmat, ch["vendor"], net_price=_rp, confirm=True))
+            report.append(f"      raw PIR {ch.get('name')}: {'ok' if 'Created' in _rpir else _rpir[:70]}")
+            if ch.get("price"):
+                _rcost = _plain(create_cost_condition(cmat, ch["vendor"], float(ch["price"]), confirm=True))
+                report.append(f"      raw cost {ch.get('name')}: {'ok' if 'Created' in _rcost else _rcost[:70]}")
         child_rows.append({"component": cmat, "quantity": ch.get("quantity", 1)})
         sp.add_kg(cmat, ch.get("type", "ROH"), description=cdesc[:40])
         sp.add_kg(halb, "HALB", edges=[("uses", cmat, {"quantity": ch.get("quantity", 1)})])

@@ -1011,11 +1011,69 @@ def _build_material_payload(
 
 
 @mcp.tool()
+def _product_header_fields() -> dict:
+    """{lowercase -> real} names of every A_Product HEADER field, from LIVE $metadata. The header entity
+    is the one keyed solely on 'Product'. This is what makes the create metadata-driven: the service's own
+    contract defines what's writable, so any header field flows through with no per-field code. {} if the
+    metadata can't be read (then extras are skipped, honestly)."""
+    fields, meta = _load_metadata(None)
+    hdr = next((e for e, m in meta.items() if list(m.get("keys") or []) == ["Product"]), None)
+    if not hdr:
+        return {}
+    return {f["field"].lower(): f["field"] for f in fields if f["entity"] == hdr}
+
+
+def _product_header_types() -> dict:
+    """{lowercase field -> Edm type} for A_Product header fields, so the passthrough can format each value by
+    its ACTUAL type (a boolean like DocumentIsCreatedByCAD must be JSON true, not the string 'True')."""
+    fields, meta = _load_metadata(None)
+    hdr = next((e for e, m in meta.items() if list(m.get("keys") or []) == ["Product"]), None)
+    if not hdr:
+        return {}
+    return {f["field"].lower(): (f.get("type") or "") for f in fields if f["entity"] == hdr}
+
+
+def _coerce(val, edm_type):
+    """Format a value for the A_Product POST body by its $metadata Edm type. Booleans MUST be real JSON
+    booleans; everything else rides as a string (OData v2 JSON accepts string for Edm.Decimal/String/etc.)."""
+    t = (edm_type or "").lower()
+    if "boolean" in t:
+        return str(val).strip().lower() in ("true", "x", "1", "yes", "y", "t")
+    return str(val)
+
+
+def _apply_extra_fields(payload: dict, extra_fields: dict | None) -> list:
+    """Merge caller-supplied fields into the A_Product HEADER, VALIDATED against $metadata by EXACT field
+    name (case-insensitive). Only real header fields are set; anything else is skipped and reported -- never
+    silently dropped, never blindly POSTed. Returns notes ['set NetWeight = 0.045', 'SKIPPED foo ...']. This
+    is the generic passthrough: name the column as the OData field (find_field resolves it) and it lands in
+    SAP -- weights, dimensions, country of origin, hazmat, anything the header exposes -- with no code."""
+    notes = []
+    extras = {k: v for k, v in (extra_fields or {}).items() if str(v).strip() not in ("", "None")}
+    if not extras:
+        return notes
+    valid = _product_header_fields()
+    types = _product_header_types()
+    if not valid:
+        return [f"attributes SKIPPED ({len(extras)}) -- could not load A_Product $metadata to validate them"]
+    for k, v in extras.items():
+        real = valid.get(str(k).strip().lower())
+        if real:
+            payload[real] = _coerce(v, types.get(str(k).strip().lower()))   # type-aware (booleans -> JSON bool)
+            notes.append(f"set {real}={payload[real]}")
+        else:
+            notes.append(f"SKIPPED '{k}' -- not an A_Product header field (use the exact OData name; try find_field)")
+    return notes
+
+
 def build_material_payload(
     description: str,
     product_type: str = "ROH",
     base_unit: str = "EA",
-    product_group: str = "50101001",
+    product_group: str = "01",          # NEUTRAL fallback ("Material group 01"). Was 50101001 = "CPUs
+    # Processors" -- a laptop-demo group that stamped a fake-specific classification on EVERY part (a bezel,
+    # a bolt, a wheel all read "CPUs Processors"). '01' is an honest placeholder, like net_price 0.01: it
+    # says "unclassified" rather than lying. A BOM `ProductGroup` column overrides it per-part (passthrough).
     long_text: str | None = None,
     plant: str | None = None,
     mrp_type: str = "PD",
@@ -1024,6 +1082,7 @@ def build_material_payload(
     standard_price: float = 100.0,
     sales_org: str | None = None,
     distribution_channel: str = "10",
+    extra_fields: dict | None = None,
 ) -> str:
     """Assemble a ready-to-POST deep-insert payload, then hand it to create_material.
 
@@ -1046,8 +1105,10 @@ def build_material_payload(
         valuation_class=valuation_class, standard_price=standard_price,
         sales_org=sales_org, distribution_channel=distribution_channel,
     )
+    extra_notes = _apply_extra_fields(fields, extra_fields)   # $metadata-validated passthrough (any header field)
     return json.dumps({
         "fields": fields,
+        "extra_notes": extra_notes,
         "next": "Pass `fields` to create_material(confirm=false) to preview, "
                 "then confirm=true to write.",
     }, indent=2)

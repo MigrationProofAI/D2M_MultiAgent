@@ -17,6 +17,7 @@ server is down, the tool returns a CLEAR error (never a silent success) so the m
 "demand created" -- the exact failure mode seen in session 2de78243.
 """
 import os
+import re
 import json
 import asyncio
 
@@ -107,6 +108,33 @@ def _invoke_http(url: str, tool: str, args: dict, down_hint: str) -> str:
 _DEMAND_DOWN = ("Start it with `python run_demand.py` (mcp-plndindepreqmt on :8003, "
                 "needs SAP_USER/SAP_PASS).")
 
+_MATNUM = re.compile(r"^\d{4,}$")           # SAP material numbers are numeric (5-digit typical)
+
+
+def _resolve_material(material: str) -> tuple[str, str]:
+    """A planning call needs the material NUMBER, not its description -- SAP rejects a description with
+    an opaque 'not defined' error that looks like a plant-enablement gap (it isn't). If `material` isn't
+    numeric, resolve it by description via search_materials FIRST, so a call like
+    create_demand("FG-PUMP-SKID-001", ...) just works instead of derailing into an unrelated recovery
+    loop (session 5fc3f68b: description sent as-is -> 'not defined' -> the model wrongly self-diagnosed
+    a plant-enablement problem and spun into enable_plant_production retries).
+    Returns (resolved_material, note) -- note is "" when no resolution was needed/attempted."""
+    material = str(material).strip()
+    if _MATNUM.match(material):
+        return material, ""
+    try:
+        from sap import search_materials
+        hits = json.loads(search_materials(description=material, top=5)).get("materials", [])
+    except Exception as e:
+        return material, f"(could not resolve {material!r} to a material number: {type(e).__name__}: {e})"
+    if len(hits) == 1:
+        resolved = hits[0]["Product"]
+        return resolved, f"(resolved {material!r} -> material {resolved})"
+    if not hits:
+        return material, f"(no material found matching description {material!r})"
+    return material, (f"({len(hits)} materials match {material!r} -- "
+                      f"{', '.join(h['Product'] for h in hits[:5])}; pass the exact material number)")
+
 
 def _months(start: str, end: str) -> list[str]:
     """Inclusive YYYYMM range start..end (e.g. '202607'..'202612' -> the six Jul-Dec buckets).
@@ -140,6 +168,10 @@ def create_demand(material: str, plant: str = "1710", quantity: str = "100",
     SAFETY GATE: confirm=false (default) only PREVIEWS. Confirm with the user, then call again with
     confirm=true. Runs on the remote mcp-demand server.
     """
+    material, _note = _resolve_material(material)
+    if _note and "resolved" not in _note:                      # ambiguous / not-found -- stop here, clearly
+        return f"ERROR: {_note}"
+
     if period_to:
         if not period:
             return ("ERROR: when using period_to (a range) you must also give the START `period` "
@@ -152,10 +184,10 @@ def create_demand(material: str, plant: str = "1710", quantity: str = "100",
 
     if not confirm:
         shown = ", ".join(p or "next month" for p in periods)
-        return (f"PREVIEW -- nothing written. Would create Planned Independent Requirements (forecast) "
-                f"demand for material {material} @ plant {plant}: {quantity} units in {len(periods)} "
-                f"period(s) [{shown}], type VSF/00 (API_PLND_INDEP_RQMT_SRV). Confirm with the user, "
-                "then call again with confirm=true.")
+        return (f"PREVIEW -- nothing written. {_note + ' ' if _note else ''}Would create Planned Independent "
+                f"Requirements (forecast) demand for material {material} @ plant {plant}: {quantity} units "
+                f"in {len(periods)} period(s) [{shown}], type VSF/00 (API_PLND_INDEP_RQMT_SRV). Confirm "
+                "with the user, then call again with confirm=true.")
 
     results = [(per, _invoke_http(DEMAND_MCP_URL, "create_plndindepreqmt",
                                   {"product": str(material), "plant": str(plant),
@@ -184,10 +216,15 @@ def run_mrp(material: str, plant: str = "1710", multi_level: bool = True,
     planning_mode: '1'=adapt (normal), '3'=delete & recreate (demo: rebuilds the full plan each run).
     SAFETY GATE: confirm=false (default) only PREVIEWS. Runs on the remote NWRFC planning server.
     """
+    material, _note = _resolve_material(material)
+    if _note and "resolved" not in _note:                      # ambiguous / not-found -- stop here, clearly
+        return f"ERROR: {_note}"
+
     if not confirm:
         scope = "multi-level (MD02, whole BOM)" if multi_level else "single-level (MD03, header only)"
-        return (f"PREVIEW -- nothing run. Would run {scope} MRP for material {material} @ plant {plant} "
-                f"(planning mode {planning_mode}). Confirm with the user, then call again with confirm=true.")
+        return (f"PREVIEW -- nothing run. {_note + ' ' if _note else ''}Would run {scope} MRP for material "
+                f"{material} @ plant {plant} (planning mode {planning_mode}). Confirm with the user, "
+                "then call again with confirm=true.")
     return _invoke("run_mrp", {"material": str(material), "plant": str(plant),
                                "multi_level": bool(multi_level), "planning_mode": str(planning_mode)})
 

@@ -23,8 +23,9 @@ OP_COLS = ["node_id", "operation", "text", "work_center", "setup_time", "run_tim
 _VENDORS = ["V-ACME", "V-CELL", "V-MOTORS", "V-PROPS", "V-NAV", "V-FRAME", "V-BOLT", "V-EPOXY"]
 
 
-def build_bom(n, seed=42):
-    """Return (bom_rows, op_rows) totalling exactly `n` material rows (1 FERT + HALBs + bought)."""
+def build_bom(n, seed=42, vendor="17300001"):
+    """Return (bom_rows, op_rows) totalling exactly `n` material rows (1 FERT + HALBs + bought).
+    `vendor` is used on every bought row (must be a REAL SAP supplier so PIR/cost commit)."""
     rng = random.Random(seed)
     bom, ops = [], []
 
@@ -59,12 +60,12 @@ def build_bom(n, seed=42):
         for j in range(per[i]):
             row(id=f"{hid}R{j}", parent_id=hid, level=2, role="bought", type=rng.choice(["ROH", "HAWA"]),
                 name=f"Raw{i}_{j}", description=f"Raw part {i}-{j}", quantity=rng.choice([1, 1, 2, 4]),
-                unit="EA", vendor=rng.choice(_VENDORS), price=round(rng.uniform(0.5, 45), 2))
+                unit="EA", vendor=vendor, price=round(rng.uniform(0.5, 45), 2))
 
     for k in range(top_total):
         row(id=f"B{k}", parent_id="P", level=1, role="bought", type=rng.choice(["HAWA", "ROH"]),
             name=f"Buy{k}", description=f"Bought part {k}", quantity=rng.choice([1, 1, 2]),
-            unit="EA", vendor=rng.choice(_VENDORS), price=round(rng.uniform(1, 50), 2))
+            unit="EA", vendor=vendor, price=round(rng.uniform(1, 50), 2))
 
     return bom, ops
 
@@ -94,6 +95,7 @@ def main():
     ap.add_argument("--n", type=int, default=50, help="total material rows (1 FERT + HALBs + bought)")
     ap.add_argument("--out", default="bom.xlsx")
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--vendor", default="17300001", help="real SAP supplier for all bought rows")
     ap.add_argument("--template", action="store_true", help="write an empty header-only workbook")
     args = ap.parse_args()
 
@@ -102,7 +104,7 @@ def main():
         print(f"wrote empty template -> {args.out}")
         return
 
-    bom, ops = build_bom(args.n, args.seed)
+    bom, ops = build_bom(args.n, args.seed, args.vendor)
     write_xlsx(args.out, bom, ops)
     # self-validate: parse it back
     from excel_bom import genesis_from_excel

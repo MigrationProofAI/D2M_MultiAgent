@@ -57,7 +57,8 @@ run_genesis's result may end with a line beginning "@@DATA@@" -- that powers the
 the user. NEVER repeat, quote, or mention it; reply only from the readable report ABOVE it."""
 
 _GENESIS_KEYWORDS = ("build this", "genesis", "assembly", "from the image", "from the parts",
-                     "disassembled", "finished good", "master data set", "the laptop", "the parts in")
+                     "disassembled", "finished good", "master data set", "the laptop", "the parts in",
+                     "bom from file", "load bom", "from file", ".xlsx", "bom file", "excel bom")
 
 
 def is_genesis(text: str, has_image: bool = False) -> bool:

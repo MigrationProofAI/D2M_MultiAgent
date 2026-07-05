@@ -35,6 +35,84 @@ def _spec(name, desc, props, required):
         "parameters": {"type": "object", "properties": props, "required": required}}}
 
 
+def load_bom_from_file(path: str, confirm: bool = False, enrich: bool = False, on_step=None) -> str:
+    """Drive genesis DETERMINISTICALLY from a tabbed-Excel BOM file (no vision model): parse the
+    workbook into a genesis spec, then run the same run_genesis write-chain. confirm=false previews.
+
+    enrich=false (default) uses ONLY the sourcing in the file -- lossless, reproducible, ~0 tokens (this is
+    what scale tests want). enrich=true runs an OPT-IN web-sourcing pass first: for any bought part with a
+    BLANK price, it searches the web and fills a real unit price before the preview/commit (the "it found
+    the price" behaviour of image genesis, on the lossless file path). Vendor is unchanged. Leave it off to
+    keep a run fully deterministic."""
+    try:
+        from excel_bom import genesis_from_excel                 # mcp_server is on sys.path
+    except Exception as e:
+        return f"Excel BOM support unavailable (openpyxl missing?): {type(e).__name__}: {e}"
+    p = path
+    if not os.path.exists(p):                                    # allow a bare filename next to the rig
+        alt = os.path.join(os.path.dirname(os.path.abspath(__file__)), path)
+        if os.path.exists(alt):
+            p = alt
+        else:
+            return (f"BOM file not found: {path!r}. Put the .xlsx next to the rig or give a full path. "
+                    "Generate one with `python gen_bom_fixture.py --n 50 --out bom_50.xlsx`.")
+    try:
+        spec, warnings = genesis_from_excel(p)
+    except Exception as e:
+        return f"Failed to parse Excel BOM {path!r}: {type(e).__name__}: {e}"
+    enrich_head = ""
+    if enrich:
+        try:
+            from enrichment import enrich_sourcing
+            spec, enotes = enrich_sourcing(spec)
+            enrich_head = "Web-sourcing (opt-in):\n" + "\n".join(f"  {n}" for n in enotes) + "\n\n"
+        except Exception as e:
+            enrich_head = f"Web-sourcing skipped ({type(e).__name__}: {e}).\n\n"
+    head = ("Parse warnings:\n" + "\n".join(f"  - {w}" for w in warnings) + "\n\n") if warnings else ""
+    if not confirm:
+        # PREVIEW: a decision-grade PLAN REPORT (deterministic contract + cost + flags), not a raw tree dump.
+        # This is what the board reasons on and the user approves; web.py renders the tabbed Genesis Plan card.
+        try:
+            from plan_report import plan_report
+            pr = plan_report(spec, (spec.get("parent") or {}).get("plant") or "1710")
+            return enrich_head + head + pr["summary"]
+        except Exception as e:
+            return enrich_head + head + str(run_genesis(spec, confirm=False)) + f"\n(plan report unavailable: {e})"
+    return enrich_head + head + str(run_genesis(spec, confirm=True, on_step=on_step))
+
+
+def reconcile_routings(bom_file: str, fert: str, plant: str = "1710") -> str:
+    """PRE-vs-POST routing reconciliation for a committed file-genesis: for each MADE node, the work centers
+    the BOM file PLANNED vs the routing actually CREATED in SAP -- MATCH / DRIFT / MISSING per node, plus the
+    work-center coverage (planned vs created). Read-only, deterministic. Renders a Routing Reconciliation card.
+
+    Args:
+        bom_file: the .xlsx BOM that was committed (e.g. 'bom_auto_300.xlsx').
+        fert: the FERT material number created by that genesis (e.g. '13973'); the tree expands from it.
+        plant: plant code (default 1710).
+    """
+    try:
+        from excel_bom import genesis_from_excel
+        from conformance import reconcile_routings as _rr
+        from plan_card import routing_recon_card
+    except Exception as e:
+        return f"Routing reconciliation unavailable: {type(e).__name__}: {e}"
+    p = bom_file
+    for cand in (bom_file, os.path.join(os.path.dirname(os.path.abspath(__file__)), bom_file),
+                 os.path.join(os.path.dirname(os.path.abspath(__file__)), "mcp_server", bom_file)):
+        if os.path.exists(cand):
+            p = cand
+            break
+    try:
+        spec, _ = genesis_from_excel(p)
+    except Exception as e:
+        return f"Could not parse BOM {bom_file!r}: {type(e).__name__}: {e}"
+    res = _rr(spec, [str(fert)], plant)
+    card = routing_recon_card(res["data"])
+    data_block = "@@DATA@@" + card.split("@@DATA@@", 1)[1] if "@@DATA@@" in card else ""
+    return res["report"] + "\n" + data_block
+
+
 # --- skill tools (Step 3): progressive disclosure. The registry is set per-session by the loop/gate ---
 _SKILL_REG = None
 
@@ -376,6 +454,28 @@ TOOLS = {
                   "dedup?:bool (OPTIONAL — leave it OUT. The rig controls reuse via GENESIS_DEDUP, "
                   "currently OFF = always create fresh, never reuse old materials. Do not set this true.)}"},
          "confirm": {"type": "boolean"}}, ["spec"])),
+
+    "load_bom_from_file": (load_bom_from_file, _spec(
+        "load_bom_from_file", "Design2Make from a FILE: deterministically parse a tabbed-Excel BOM "
+        "(sheets 'BOM' + 'Operations') into a genesis spec and build the WHOLE assembly -- multi-level, "
+        "with PIR + cost for EVERY bought part at EVERY level. Use for 'load/build/upload the BOM from "
+        "<file>.xlsx' or scale-test files (50/100/150/200 parts). NO vision model -- lossless & "
+        "reproducible. confirm=false PREVIEWS the plan (no writes); confirm=true COMMITS. Prefer this "
+        "over run_genesis whenever the user names an .xlsx BOM file. Set enrich=true ONLY if the user asks "
+        "to web-source / look up prices for parts left blank (opt-in; costs web calls); default off keeps "
+        "the run fully deterministic.",
+        {"path": {"type": "string", "description": "path to the .xlsx BOM file, e.g. bom_50.xlsx"},
+         "confirm": {"type": "boolean"},
+         "enrich": {"type": "boolean", "description": "opt-in: web-source a real price for bought parts "
+                    "whose price is blank, before preview/commit. Default false."}}, ["path"])),
+    "reconcile_routings": (reconcile_routings, _spec(
+        "reconcile_routings", "PRE-vs-POST routing reconciliation: for a committed file-genesis, compare the "
+        "work centers each made node's routing was PLANNED with (from the BOM file) vs what was actually "
+        "CREATED in SAP -- MATCH / DRIFT / MISSING per node. Use when the user asks to 'recon routings', "
+        "'compare planned vs actual routings', or check if routings match the plan. Read-only.",
+        {"bom_file": {"type": "string", "description": "the committed .xlsx BOM, e.g. bom_auto_300.xlsx"},
+         "fert": {"type": "string", "description": "the FERT material number created by that genesis, e.g. 13973"},
+         "plant": {"type": "string", "description": "plant (default 1710)"}}, ["bom_file", "fert"])),
 
     "enable_plant_production": (enable_plant_production, _spec(
         "enable_plant_production", "THE tool for 'extend <product/assembly> to plant <X>' / 'make <product> "

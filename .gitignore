@@ -41,3 +41,7 @@ static_v2.bak/
 
 # generated BOM fixtures (regenerable via gen_bom_fixture.py)
 bom_*.xlsx
+_*.log
+_*.out
+~\$*
+nohup.out

@@ -50,7 +50,9 @@ _HEAL_TOOLS = [n for n in TOOLS if n != "search_materials" and n not in _PLANNIN
 from agent import run_turn
 from genesis_mode import GENESIS_PERSONA, is_genesis
 from model_client import GENESIS_MODEL
-from orchestrate import ORCHESTRATE_ON, verify_claim, subagent
+from orchestrate import ORCHESTRATE_ON, verify_claim, verify_claim_chunked, subagent
+from object_verifier import verify_genesis_objects   # deterministic genesis gate: ~0 tokens, no context limit
+import verification_cards                             # render verifier output as Structured-Data cards (in Python)
 from boardroom import convene_board, _verdict_of
 from guide import is_platform_question, GUIDE_PERSONA
 from planner import PLANNER_PERSONA, is_planning
@@ -63,11 +65,12 @@ import learn
 
 # Tools whose confirm=true commits a real write to SAP/planning. A genesis turn that includes one of
 # these is "doer claims it created something" -> the verify loop should certify it (when the flag is on).
-_WRITE_TOOLS = {"run_genesis", "enable_plant_production", "create_material", "update_material",
-                "create_bom", "add_bom_component", "remove_bom_component", "extend_to_plant",
-                "create_demand", "run_mrp", "create_info_record", "create_cost_condition",
-                "change_material", "change_routing", "change_pir", "change_cost_condition",
-                "change_bom", "set_routing_operation", "set_supplier_terms", "set_condition_price"}
+_WRITE_TOOLS = {"run_genesis", "load_bom_from_file", "enable_plant_production", "create_material",
+                "update_material", "create_bom", "add_bom_component", "remove_bom_component",
+                "extend_to_plant", "create_demand", "run_mrp", "create_info_record",
+                "create_cost_condition", "change_material", "change_routing", "change_pir",
+                "change_cost_condition", "change_bom", "set_routing_operation", "set_supplier_terms",
+                "set_condition_price"}
 
 
 def _committed_write(steps) -> bool:
@@ -79,11 +82,56 @@ def _committed_write(steps) -> bool:
     return False
 
 
+_AFFIRM = re.compile(r"^\s*(go\s*ahead|go|yes|yep|yeah|ok(ay)?|sure|proceed|confirm|commit|do\s*it|"
+                     r"create\s*(them|it)?|build\s*it|make\s*(them|it)?|approved?|ship\s*it)\b[\s.!`]*$", re.I)
+
+
+def _is_affirmation(text) -> bool:
+    """A short, unambiguous 'yes, go' — used to route a pending BOM-file COMMIT deterministically instead of
+    letting the model re-interpret the plan. Kept strict (whole-message match) so a real instruction that just
+    happens to start with 'go' (e.g. 'go create a demand') does NOT count."""
+    return bool(_AFFIRM.match((text or "").strip()))
+
+
+def _bom_preview_call(steps):
+    """(path, enrich) of a load_bom_from_file PREVIEW (confirm not true) in these steps, else None. This is
+    what a genesis file PREVIEW looks like; remembering it lets the next 'go ahead' commit the SAME parsed
+    (deep) spec deterministically -- never a model-rebuilt run_genesis spec that flattens the hierarchy."""
+    for s in steps or []:
+        if s.get("kind") == "tool_call" and s.get("tool") == "load_bom_from_file":
+            a = s.get("args") or {}
+            if a.get("confirm") is not True and a.get("path"):
+                return str(a.get("path")), bool(a.get("enrich"))
+    return None
+
+
+def _committed_bom_path(steps):
+    """Path of a load_bom_from_file COMMIT (confirm=True) in these steps, else None -- lets the verify loop
+    re-parse the spec and run the CONFORMANCE audit (actual SAP vs intended contract) on a file-driven genesis."""
+    for s in steps or []:
+        if s.get("kind") == "tool_call" and s.get("tool") == "load_bom_from_file":
+            a = s.get("args") or {}
+            if a.get("confirm") is True and a.get("path"):
+                return str(a.get("path"))
+    return None
+
+
+def _planned_material(steps):
+    """(material, plant) of a CONFIRMED run_mrp this turn, else None. An MRP run creates no materials to
+    anchor a master-data verifier on -- so we anchor the recursive MRP-TREE validator on what was planned."""
+    for s in steps or []:
+        if s.get("kind") == "tool_call" and s.get("tool") == "run_mrp":
+            a = s.get("args") or {}
+            if a.get("confirm") is True and a.get("material"):
+                return str(a.get("material")), str(a.get("plant", "1710"))
+    return None
+
+
 # D2M material numbers are 5-digit 1xxxx (e.g. 11757). BOM (00000508), routing (50000322), PIR
 # (5300007194) and cost-condition numbers are 8-10 digits, so this pattern picks materials only.
 _MATNUM = re.compile(r"\b(1\d{4})\b")
-_CREATE_TOOLS = {"create_material", "run_genesis", "enable_plant_production", "create_bom",
-                 "build_material_payload"}
+_CREATE_TOOLS = {"create_material", "run_genesis", "load_bom_from_file", "enable_plant_production",
+                 "create_bom", "build_material_payload"}
 _NON_MATERIAL_NUMS = {"10000", "100000"}   # production-version lot-size bounds, not materials
 
 # A material number is only anchored when it appears in an EXPLICIT material context inside a creation
@@ -492,6 +540,21 @@ async def ws(websocket: WebSocket, sid: str):
         mem = st["mem"]
         set_current_session(mem.session)              # so write_skill_artifact / promote_skill know the session
 
+        # EXCEL BOM UPLOAD: an attached .xlsx arrives on the image channel but starts with the ZIP
+        # signature (PK\x03\x04) -- a vision image never does. So it's a DETERMINISTIC genesis input:
+        # save it and rewrite the turn as the load_bom_from_file chat flow, which reuses the existing
+        # preview + board + confirm. No vision model, lossless.
+        if img and img[:4] == b"PK\x03\x04":
+            _bomdir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "uploads")
+            os.makedirs(_bomdir, exist_ok=True)
+            _bompath = os.path.join(_bomdir, f"bom_{mem.session}.xlsx")
+            with open(_bompath, "wb") as _f:
+                _f.write(img)
+            await websocket.send_text(json.dumps({"type": "note", "text":
+                f"\U0001F4C4 Excel BOM received ({len(img) // 1024} KB) — parsing deterministically (no vision model)…"}))
+            text = f"load bom from file {_bompath}"
+            img = None
+
         # LIVE REASONING CHAIN: turn the opaque "working…" into a running, agent-labelled account of what
         # each agent is thinking and doing. Two channels: a transient `status` (the spinner line) and a
         # PERSISTENT `activity` event the Agent-Activity panel appends. on_step fires inside run_turn (in a
@@ -541,7 +604,28 @@ async def ws(websocket: WebSocket, sid: str):
         _emit = _emitter("doer")                       # the doer narrates by default
 
         steps = []
-        if is_platform_question(text) and not img:
+        _pending = st.get("pending_bom")
+        if _pending and not img and _is_affirmation(text) and os.path.exists(_pending.get("path", "")):
+            # DETERMINISTIC FILE-BOM COMMIT: the user is confirming a BOM-file preview. Re-run the SAME
+            # deterministic parse+build (load_bom_from_file), NOT the model's discretion -- the model
+            # sometimes re-composes a run_genesis spec and FLATTENS the hierarchy (L4 built only 5 of 23,
+            # session 38682bf9; also forced healing on 76182701). The parsed spec is the source of truth;
+            # the commit must use it verbatim. Then the normal verify/heal loop runs on what was created.
+            intent = "genesis"
+            injected, lessons = False, []
+            _p, _enr = _pending["path"], _pending.get("enrich", False)
+            _conductor(f"🧱 committing the parsed BOM deterministically — {os.path.basename(_p)}"
+                       + (" (+web-sourcing)" if _enr else "") + " — no model re-interpretation")
+            _activity("doer", "tool", tool="load_bom_from_file", hint=os.path.basename(_p))
+            from tools import load_bom_from_file as _lbff
+            answer = await asyncio.to_thread(_lbff, _p, True, _enr, _emit)  # path, confirm, enrich, LIVE stream
+            steps.append({"author": "doer", "kind": "tool_call", "tool": "load_bom_from_file",
+                          "args": {"path": _p, "confirm": True, "enrich": _enr}})
+            steps.append({"author": "doer", "kind": "tool_result", "tool": "load_bom_from_file",
+                          "result": str(answer)[:8000]})
+            st["pending_bom"] = None
+            learn_line = "DETERMINISTIC file-BOM commit (bypassed model spec-rebuild — no flattening)"
+        elif is_platform_question(text) and not img:
             # THE GUIDE (the "demo lady"): a meta question ABOUT the tool/architecture, not a master-data
             # task -> a read-only Guide agent explains it, briefly and spoken-style. The client speaks the
             # answer in the nova voice. No SAP tools, no writes.
@@ -565,11 +649,14 @@ async def ws(websocket: WebSocket, sid: str):
             if BOARD_ON and ORCHESTRATE_ON and not _committed_write(steps):
                 _conductor("🪑 convening the function board on the plan…")
 
+                _board_members = []                        # captured for the Board tab of the plan card
+
                 def _on_member(func, phase, txt):
                     if phase == "start":
                         _activity(func.lower(), "phase", text=f"{func} reviewing the plan…")
                     else:                                  # done
                         v = _verdict_of(txt) if txt else ""
+                        _board_members.append({"func": func, "vote": v, "note": (txt or "")[:400]})
                         _activity(func.lower(), "reasoning", text=(f"[{v}] " if v else "") + (txt or "")[:700])
                         _status(f"🪑 {func}: {v}")
 
@@ -592,6 +679,25 @@ async def ws(websocket: WebSocket, sid: str):
                           "🪑 BOARD: NO-GO — the function panel flagged blockers in the plan (below). Review before you confirm.")
                 answer = f"{answer}\n\n---\n### {banner}\n{board['verdict']}"
                 learn_line += f" · [board] {'GO' if go else 'NO-GO'}"
+                # PRE-GENESIS PLAN CARD: for a FILE preview, render the tabbed contract (Materials|PIRs|Cost|
+                # BOMs|Routings|PVs|Board) into the Structured-Data panel -- the decision surface to sign off on.
+                _pv = _bom_preview_call(steps)
+                if _pv:
+                    try:
+                        from excel_bom import genesis_from_excel as _gfe
+                        from plan_report import plan_report as _plr
+                        from plan_card import plan_card as _pcard
+                        _pth = _pv[0] if os.path.exists(_pv[0]) else os.path.join(
+                            os.path.dirname(os.path.abspath(__file__)), "mcp_server", _pv[0])
+                        _spec, _ = await asyncio.to_thread(_gfe, _pth if os.path.exists(_pth) else _pv[0])
+                        _pr = await asyncio.to_thread(_plr, _spec, "1710")
+                        _bd = {"verdict": "GO" if go else "NO-GO", "text": board.get("verdict", ""),
+                               "members": _board_members}
+                        steps.append({"author": "board", "kind": "tool_result", "tool": "genesis_plan",
+                                      "result": _pcard(_pr["data"], _bd)})
+                        _conductor("🧾 Genesis Plan card rendered — review the tabs before you approve")
+                    except Exception as _pe:
+                        _activity("conductor", "phase", text=f"(plan card unavailable: {type(_pe).__name__}: {_pe})")
         elif is_planning(text):
             # THE PLANNER (Design -> Make -> PLAN): demand + MRP for an ALREADY-MRP-ready material.
             # Scoped to PLANNER_TOOLS -> it structurally CANNOT create/change master data.
@@ -619,7 +725,30 @@ async def ws(websocket: WebSocket, sid: str):
         # with teeth). UNVERIFIED items (no read tool) are reported but never chased. The fix for the
         # false-complete + half-finished genesis in sessions 903d6806 / 67664336. Default off.
         anchor = _created_materials(steps)
-        if ORCHESTRATE_ON and _committed_write(steps) and not anchor:
+        planned = _planned_material(steps)
+        if ORCHESTRATE_ON and planned:
+            # PLANNING WRITE -> the recursive MRP-TREE validator (the Plan-Verifier). A committed run_mrp
+            # produces no created materials, so the master-data verifier can't anchor -- but the MRP RESULT
+            # is exactly what needs certifying. This deterministic gate ALWAYS runs after a run_mrp: it walks
+            # the whole BOM, reads MD04 per material, and certifies made->planned order / bought->purchase
+            # req / demand covered, to any depth. Replaces the old "not independently verified" skip.
+            _pmat, _pplant = planned
+            _conductor(f"🌳 validating the MRP tree for {_pmat} @ {_pplant} (recursive, deterministic)…")
+            try:
+                from plan_verifier import verify_mrp_tree
+                _res = await asyncio.to_thread(verify_mrp_tree, _pmat, _pplant, _emitter("verifier"))
+                answer = f"{answer}\n\n---\n### 🌳 {_res['banner']}\n{_res['report']}"
+                learn_line += f" · [mrp-tree] {_res['verdict']}"
+                try:                                  # deterministic MRP-tree CARD -> Structured-Data panel
+                    steps.append({"author": "verifier", "kind": "tool_result", "tool": "mrp_tree_verification",
+                                  "result": verification_cards.mrp_tree_card(_res.get("data") or {})})
+                except Exception:
+                    pass                              # a card render must never break the turn
+            except Exception as _e:
+                answer = (f"{answer}\n\n---\n### ⚠️ MRP-tree validation errored ({type(_e).__name__}: {_e}). "
+                          f"The MRP run itself is unaffected; re-run the validation.")
+                learn_line += " · [mrp-tree] error"
+        elif ORCHESTRATE_ON and _committed_write(steps) and not anchor:
             # GUARD: a write happened but no material numbers were produced -> we cannot anchor the
             # verifier to a scope. Do NOT verify/heal (an unanchored verifier could grab the wrong
             # product). Surface it honestly instead of healing blind.
@@ -628,10 +757,15 @@ async def ws(websocket: WebSocket, sid: str):
                       f"numbers I could anchor a SAP read-back to, so I did NOT run the verifier (it must "
                       f"never guess a scope). Re-run so the genesis reports its created material numbers.")
             learn_line += " · [verify] skipped (no anchor)"
-        elif ORCHESTRATE_ON and _committed_write(steps):
+        elif ORCHESTRATE_ON and anchor:
+            # Fire whenever a genesis actually CREATED materials -- the anchor IS the proof it committed,
+            # independent of how the confirm flag was recorded (the file-driven load_bom_from_file commit
+            # didn't register as _committed_write, so the deterministic verify silently skipped -- session
+            # feb1aa32). _created_materials mines only create-tool RESULTS, so a preview (creates nothing)
+            # leaves anchor empty and never trips this.
             _verifier_emit = _emitter("verifier")
-            _conductor(f"🔍 verifying {len(anchor)} material(s) against SAP…")
-            passed, missing, unverified, verdict = await asyncio.to_thread(verify_claim, answer, anchor=anchor, on_step=_verifier_emit)
+            _conductor(f"🔍 verifying {len(anchor)} material(s) against SAP (deterministic, ~0 tokens)…")
+            passed, missing, unverified, verdict, vdata = await asyncio.to_thread(verify_genesis_objects, anchor, "1710", _verifier_emit)
             heals, steer_notes, dropped, stopped = 0, [], set(), False
             while (not passed) and missing > 0 and heals < HEAL_MAX:
                 notes, stop = await _drain_steer()   # /btw guidance the user typed mid-run
@@ -653,8 +787,8 @@ async def ws(websocket: WebSocket, sid: str):
                                                  True, 20, True, hs, False, GENESIS_MODEL, _HEAL_TOOLS, _emit, "doer")
                 steps.extend(hs)
                 anchor = [a for a in _created_materials(steps) if a not in dropped]   # newly-created join; dropped phantoms leave
-                _conductor(f"🔍 re-verifying against SAP (after heal {heals})…")
-                passed, missing, unverified, verdict = await asyncio.to_thread(verify_claim, answer, anchor=anchor, on_step=_verifier_emit)
+                _conductor(f"🔍 re-verifying against SAP (after heal {heals}, deterministic)…")
+                passed, missing, unverified, verdict, vdata = await asyncio.to_thread(verify_genesis_objects, anchor, "1710", _verifier_emit)
             if stopped:
                 banner = (f"⏹ Healing STOPPED on your request after {heals} pass(es). "
                           f"{missing} object(s) were still MISSING when you stopped.")
@@ -664,12 +798,44 @@ async def ws(websocket: WebSocket, sid: str):
                 banner = (f"❌ STILL INCOMPLETE after {heals} auto-heal pass(es) — {missing} object(s) remain "
                           f"MISSING in SAP. Do NOT trust any 'complete' above.")
             else:
-                banner = (f"⚠️ Everything readable is VERIFIED; {unverified} object(s) are UNVERIFIABLE (no "
-                          f"read-back tool, e.g. routing / production version) — not a heal gap, just unknown.")
+                banner = (f"⚠️ Everything readable is VERIFIED; {unverified} object(s) could NOT be read after "
+                          f"retries (a read-availability hiccup, NOT a confirmed gap) — re-run to re-read them.")
             answer = f"{answer}\n\n---\n### 🔍 {banner}\n{verdict}"
             learn_line += f" · [verify] {'PASS' if passed else ('missing='+str(missing) if missing else 'unverified='+str(unverified))} · heals={heals}"
+            try:                                      # deterministic genesis-verification CARD -> Structured-Data panel
+                steps.append({"author": "verifier", "kind": "tool_result", "tool": "genesis_verification",
+                              "result": verification_cards.genesis_card(vdata)})
+            except Exception:
+                pass                                  # a card render must never break the turn
+            # CONFORMANCE AUDIT: presence+heal ensured existence; now diff ACTUAL SAP vs the INTENDED contract
+            # (the spec) field-by-field. This is real verification -- it catches DRIFT presence can't (a routing
+            # that exists but fell back to a default work center). File-driven only (needs the spec). ~0 tokens.
+            _cpath = _committed_bom_path(steps)
+            if _cpath:
+                _conductor("🧾 conformance audit — actual SAP state vs the approved plan…")
+                try:
+                    from excel_bom import genesis_from_excel as _cgfe
+                    from conformance import verify_conformance as _vconf
+                    from plan_card import conformance_card as _ccard
+                    _cp = _cpath if os.path.exists(_cpath) else os.path.join(
+                        os.path.dirname(os.path.abspath(__file__)), "mcp_server", _cpath)
+                    _cspec, _ = await asyncio.to_thread(_cgfe, _cp if os.path.exists(_cp) else _cpath)
+                    _cok, _cdiffs, _crep, _cdata = await asyncio.to_thread(
+                        _vconf, _cspec, anchor, "1710", _emitter("verifier"))
+                    _cbanner = ("✅ CONFORMS — SAP state matches the approved plan" if _cok else
+                                f"❌ {_cdata['diffs']} field(s) DO NOT conform to the plan "
+                                f"(drift/missing presence can't see — see the Conformance card)")
+                    answer = f"{answer}\n\n---\n### 🧾 {_cbanner}\n{_crep}"
+                    learn_line += f" · [conformance] {'PASS' if _cok else str(_cdata['diffs'])+' diff'}"
+                    steps.append({"author": "verifier", "kind": "tool_result", "tool": "conformance",
+                                  "result": _ccard(_cdata)})
+                except Exception as _ce:
+                    answer = f"{answer}\n\n---\n### ⚠️ Conformance audit errored ({type(_ce).__name__}: {_ce})"
 
         st["last_answer"], st["prev_intent"] = answer, intent
+        _prev = _bom_preview_call(steps)              # a BOM-file PREVIEW this turn -> remember it so the next
+        if _prev:                                     # 'go ahead' commits the SAME parsed spec deterministically
+            st["pending_bom"] = {"path": _prev[0], "enrich": _prev[1]}
         learning = {"line": learn_line, "injected": len(lessons), "avoided": 0, "repeated": 0}
         # PERSIST this turn's activity (intent + tool steps) so the Agent-Activity + Structured-Data panels
         # survive a browser refresh -- /api/sessions/{id}/trace serves it back on reload. (The live 💭

@@ -56,9 +56,16 @@ def _read_sheet(ws):
     return out
 
 
+_KNOWN_COLS = {"id", "parent_id", "level", "role", "type", "name", "description", "material",
+               "quantity", "unit", "vendor", "price", "plant"}
+
+
 def _row_to_node(r):
-    """Normalize one BOM row into a node dict (same coercions as genesis_from_csv)."""
-    return {
+    """Normalize one BOM row into a node dict (same coercions as genesis_from_csv). Any column that is NOT
+    one of the known structural columns is carried through verbatim as an `attributes` entry -- the create
+    validates each against A_Product $metadata by exact OData field name, so naming a column `NetWeight` /
+    `GrossWeight` / `WeightUnit` / `CountryOfOrigin` lands it in SAP with no per-field code."""
+    node = {
         "id": _s(r.get("id")),
         "parent_id": _s(r.get("parent_id")),
         "role": _s(r.get("role")).lower(),
@@ -72,6 +79,10 @@ def _row_to_node(r):
         "price": _f(r.get("price"), None),
         "plant": _s(r.get("plant")) or None,
     }
+    attrs = {k: v for k, v in r.items() if k and k.lower() not in _KNOWN_COLS and _s(v) != ""}
+    if attrs:
+        node["attributes"] = attrs
+    return node
 
 
 def _ops_by_node(op_rows):
@@ -130,15 +141,8 @@ def _validate(nodes, ops, warnings):
     for nid in ops:
         if nid not in idset:
             warnings.append(f"Operations: node_id '{nid}' not found in the BOM sheet.")
-    children_of = _children_map(nodes)
-    def _depth_warn(node, level):
-        for ch in children_of.get(node["id"], []):
-            if _is_made(ch) and level >= 2:
-                warnings.append(f"node '{ch['id']}' is a made sub-assembly at depth {level + 1}; genesis "
-                                f"builds BOM/routing/PV only 2 made-levels deep -- its own sub-structure "
-                                f"(BOM/routing/PV) will NOT be built.")
-            _depth_warn(ch, level + 1)
-    _depth_warn(root, 0)
+    # Depth is FULLY supported: run_genesis recurses, so a made node at ANY level (FERT->HALB->HALB->...)
+    # gets its own BOM/routing/PV. No depth cap, no flatten-warning -- depth is purely a data question.
     return root
 
 
@@ -169,6 +173,8 @@ def _to_spec_node(n, children_of, ops):
         node["vendor"] = n["vendor"]
     if n["price"] is not None:
         node["price"] = n["price"]
+    if n.get("attributes"):
+        node["attributes"] = n["attributes"]       # extra OData fields -> validated passthrough at create
     if kids:
         node["components"] = [_to_spec_node(k, children_of, ops) for k in kids]
     if n["id"] in ops:
@@ -197,7 +203,8 @@ def genesis_from_excel(path):
     children_of = _children_map(nodes)
     spec = {
         "parent": {"description": root["description"], "type": root["type"] or "FERT",
-                   "plant": root["plant"] or _DEF_PLANT, "material": root["material"]},
+                   "plant": root["plant"] or _DEF_PLANT, "material": root["material"],
+                   **({"attributes": root["attributes"]} if root.get("attributes") else {})},
         "components": [_to_spec_node(k, children_of, ops) for k in children_of.get(root["id"], [])],
     }
     if root["id"] in ops:

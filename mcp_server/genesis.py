@@ -22,6 +22,7 @@ import json
 import re
 import asyncio
 import threading
+import collections
 
 sys.path.insert(0, os.path.dirname(__file__))
 from sap import (build_material_payload, create_material, get_material,  # noqa: E402
@@ -56,8 +57,12 @@ try:
         create_routing = _mr.s_create_routing
 except Exception:
     pass
-_DEF_ROUTING = [{"operation": "10", "text": "Final Assembly", "work_center": "ASSEMBLY"},
-                {"operation": "20", "text": "Packaging", "work_center": "PACK01"}]
+# FALLBACK routing used ONLY when the spec/BOM supplies no operations (e.g. image genesis, or a file with no
+# Operations sheet). Was a fake-looking 2-step Final Assembly -> Packaging that made every routing read as a
+# real process; now ONE operation, its text marking it plainly as a placeholder to define -- the honest
+# equivalent of net_price 0.01. A BOM Operations sheet supplies real, varied routings and overrides this.
+_DEF_ROUTING = [{"operation": "0010", "text": "MAKE (default routing — no operations specified; define them)",
+                 "work_center": "ASSEMBLY"}]
 
 
 # ---- helpers ----------------------------------------------------------------
@@ -155,90 +160,97 @@ def _note_mcp(url):                                  # TELEMETRY: count a prodve
 
 
 def _create_production_version(material, plant, desc):
-    """Create the PRODUCTION VERSION (MKAL) on the remote :8002 RFC MCP server -- the final
-    master-data object that binds the BOM (alt 01 / usage 1) + sets lot size 1..10000 so MRP can
-    plan it (clears MD408). Returns (ok: bool, message: str). ok=False (with a clear reason) if
-    :8002 is unreachable or the FM reports failure -- never raises."""
-    _note_mcp(PRODVER_MCP_URL)
-    args = {"material": str(material), "plant": str(plant), "version": "0001",
-            "text": f"{(desc or str(material))[:28]} version 1",
-            "bom_usage": "1", "bom_alt": "01", "testrun": False, "extra_fields": _LOT_SIZE}
+    """Create the PRODUCTION VERSION via the mcp-routing MCP CONTRACT (OData MPE_MANAGE_PRODVER_SRV):
+    binds the BOM (usage 1 / alternative 1) + lot size 1..10000 so MRP can plan it (clears MD408).
+    Returns (ok: bool, message: str); never raises.
 
-    async def _go():
-        async with sse_client(PRODVER_MCP_URL, timeout=5, sse_read_timeout=60) as (r, w):
-            async with ClientSession(r, w) as session:
-                await session.initialize()
-                res = await session.call_tool("create_production_version", args)
-                txt = " ".join(c.text for c in res.content if getattr(c, "type", "") == "text").strip()
-                return res.isError, txt
-
+    This REPLACES the retired RFC create on sap-prodvers-mcp -- PV writes now go through the SAME OData
+    contract as PV reads (get_routing / read_production_version / create_production_version all on
+    mcp-routing). See [[mcp-tool-contract]] + [[prodver-odata-crud]]."""
+    import mcp_route
+    args = {"material": str(material), "plant": str(plant), "production_version": "0001",
+            "bom_alternative": "1", "bom_usage": "1",
+            "min_lot": _LOT_SIZE["BSTMI"], "max_lot": _LOT_SIZE["BSTMA"],
+            "text": f"{(desc or str(material))[:28]} version 1", "confirm": True}
     try:
-        is_err, txt = _run_async(_go)
-    except Exception as e:                          # :8002 down / refused / timeout / protocol error
-        leaf = e                                    # anyio nests the real cause in ExceptionGroup(s)
-        while getattr(leaf, "exceptions", None):
-            leaf = leaf.exceptions[0]
-        return False, f":8002 prodver unreachable/failed -- {type(leaf).__name__}: {leaf}"
-
-    # The FM returns {"success": bool, "message", "messages":[{type,message}]} as JSON text -- read it.
-    try:
-        d = json.loads(txt)
-        if isinstance(d, dict) and "success" in d:
-            detail = d.get("message") or "; ".join(
-                m.get("message", "") for m in d.get("messages", []) if m.get("message")) or "(no message)"
-            return bool(d["success"]), detail
-    except (ValueError, TypeError):
-        pass
-    ok = not is_err and not any(x in txt.lower()
-                                for x in ("error", "fail", "exception", "not found", "invalid"))
+        txt = mcp_route.call("routing", "create_production_version", args)
+    except Exception as e:
+        return False, f"mcp-routing prodver create unreachable/failed -- {type(e).__name__}: {e}"
+    # Success covers BOTH the fixed tool's outputs: "CREATED + VERIFIED production version ..." and the
+    # idempotent "... already exists (verified by read-back)". Match on VERIFIED/exists, not the old exact
+    # "CREATED production version" string (the tool's "+ VERIFIED" broke that substring -> false NOT-bound).
+    low = (txt or "").lower()
+    ok = ("verified production version" in low or "already exists" in low) and "fail" not in low
     return ok, (txt or "(no text)")
 
 
-def _call_prodver(tool: str, args: dict) -> str:
-    """Call a tool on the remote :8002 RFC MCP server and return its text result. Used by the READ
-    tools below (read_production_version / read_routing). Never raises -- returns an ':8002 ...' note
-    if the server is unreachable, so the caller (a verifier) can report it honestly."""
-    _note_mcp(PRODVER_MCP_URL)
-    async def _go():
-        async with sse_client(PRODVER_MCP_URL, timeout=5, sse_read_timeout=60) as (r, w):
-            async with ClientSession(r, w) as session:
-                await session.initialize()
-                res = await session.call_tool(tool, args)
-                txt = " ".join(c.text for c in res.content if getattr(c, "type", "") == "text").strip()
-                return txt
-    try:
-        return _run_async(_go)
-    except Exception as e:
-        leaf = e
-        while getattr(leaf, "exceptions", None):
-            leaf = leaf.exceptions[0]
-        return f":8002 unreachable/failed -- {type(leaf).__name__}: {leaf}"
+# RETIRED: the RFC prodver bridge (_call_prodver -> sap-prodvers-mcp/:8002) is gone. Production version
+# create AND read now go through the mcp-routing OData contract (create_production_version /
+# read_production_version -> MPE_MANAGE_PRODVER_SRV). PRODVER_MCP_URL above is kept only as a dormant
+# config stub and is no longer called. See [[mcp-tool-contract]] + [[prodver-odata-crud]].
+
+
+# DESIGN PRINCIPLE: routing + production version are OData objects OWNED by the mcp-routing MCP server.
+# Every object's reads AND writes go through its MCP tool contract (which must expose full CRUD) -- the
+# rig NEVER bypasses the contract with a direct in-process OData call. So these read-backs route to
+# mcp-routing. (Only the PV *create* is RFC on sap-prodvers-mcp; its read-back lives on mcp-routing.)
+def _routing_read(remote_tool: str, material: str, plant: str) -> str:
+    """Call the mcp-routing MCP server (via mcp_route) with ONE retry on a transient CF->SAP auth
+    hiccup ('Logon failed' / 401). Returns the raw tool text; callers shape it into a lean, HONEST
+    presence signature -- an unreadable result is reported as an error, never as present or absent.
+    (Final server-side minimization is the mcp-routing lens's job -- this rig-side shaping is the
+    interim bridge until that lands.)"""
+    import mcp_route
+    args = {"material": str(material), "plant": str(plant)}
+    out = mcp_route.call("routing", remote_tool, args)
+    if "Logon failed" in (out or "") or (out or "")[:40].find("401") >= 0:
+        out = mcp_route.call("routing", remote_tool, args)          # transient hiccup -> retry once
+    return out
 
 
 def read_production_version(material: str, plant: str = "1710") -> str:
-    """READ the production version(s) for a material+plant from table MKAL (via the :8002 RFC server).
-    Returns each VERID + the BOM it binds (STLAN usage / STLAL alternative). An empty list ("count": 0)
-    means NO production version exists yet -- a real gap a made material (FERT/HALB) must have one."""
-    return _call_prodver("read_production_version", {"material": str(material), "plant": str(plant)})
+    """READ the production version(s) for a MADE material (FERT/HALB) via the mcp-routing MCP server
+    (read_production_version -> I_ProductionVersionStdVH). LEAN signature: {"versions":["0001"]} when
+    bound; {"versions":[],"note":"no production version -- a gap"} when none. (PV *create* is RFC on
+    sap-prodvers-mcp; this is the verify read-back, through the routing contract.)"""
+    return _routing_read("read_production_version", material, plant)
 
 
 def read_routing(material: str, plant: str = "1710") -> str:
-    """READ the routing(s) assigned to a material+plant from table MAPL (via the :8002 RFC server).
-    Returns each routing's group (PLNNR) + counter (PLNAL). An empty list ("count": 0) means NO routing
-    exists yet -- a real gap a made material (FERT/HALB) must have one."""
-    return _call_prodver("read_routing", {"material": str(material), "plant": str(plant)})
+    """READ the routing assignment(s) for a MADE material via the mcp-routing MCP server (get_routing ->
+    ProductionRoutingMatlAssgmt). LEAN, HONEST signature: {"present":true,"routings":[{group,counter}]}
+    when a routing exists; {"present":false,...,"note":"no routing -- a gap"} when none;
+    {"present":null,"error":...} when the READ itself failed -- an error is NEVER dressed up as present
+    or absent."""
+    raw = _routing_read("get_routing", material, plant)
+    try:
+        rows = json.loads(raw).get("d", {}).get("results", [])
+    except Exception:
+        return json.dumps({"material": str(material), "plant": str(plant), "present": None,
+                           "error": (raw or "")[:160]})
+    groups = [{"group": r.get("ProductionRoutingGroup"),
+               "counter": r.get("ProductionRouting") or r.get("ProductionRtgMatlAssgmtIntVers")}
+              for r in rows if isinstance(r, dict) and r.get("ProductionRoutingGroup")]
+    if not groups:
+        return json.dumps({"material": str(material), "plant": str(plant),
+                           "present": False, "routings": [], "note": "no routing -- a gap"})
+    return json.dumps({"material": str(material), "plant": str(plant), "present": True, "routings": groups})
 
 
 def _create_material(spec: dict, plant: str) -> tuple[str | None, str]:
     """Create one material (parent or component) via the verified payload builder.
     FERT parents are born routable (procurement E + work-scheduling) and get a sales view."""
     ptype = spec.get("type", "HAWA")
-    payload = json.loads(build_material_payload(
+    built = json.loads(build_material_payload(
         description=(spec.get("description") or spec.get("name") or "Material")[:40],
         product_type=ptype, plant=plant,
         sales_org="1710" if ptype == "FERT" else None,
-    ))["fields"]
+        extra_fields=spec.get("attributes"),        # $metadata-validated passthrough: weights, dims, etc.
+    ))
+    payload, notes = built["fields"], built.get("extra_notes") or []
     res = create_material(fields=payload, confirm=True)
+    if notes:                                        # surface which extra fields were set / skipped
+        res = f"{res}  [attrs: {'; '.join(notes)}]"
     return _new_matnr(res), res
 
 
@@ -367,10 +379,20 @@ def _build_made_subassembly(c: dict, plant: str, sp, report: list, created_raws:
             ch["material"] = cmat
         else:
             report.append(f"      raw {ch.get('name')}: exists {cmat}")
+        # MULTI-LEVEL RECURSION: if this child is itself a MADE sub-assembly (a HALB with its OWN
+        # components), build ITS full sub-structure the same way -- own BOM + routing + production
+        # version -- to ANY depth (FERT->HALB->HALB->...). Written ONCE here: depth is now purely a
+        # data question. The child is then a MADE component of this HALB's BOM (no PIR/cost -- made,
+        # not bought). Terminates naturally: a child with no components / all-bought children stops.
+        if cmat and ch.get("components") and (ch.get("role") == "made" or ch.get("type") in ("HALB", "FERT")):
+            ch["material"] = cmat
+            _deep = _build_made_subassembly(ch, plant, sp, report, created_raws, _dd)
+            if _deep:
+                sub.setdefault("subassemblies", []).append(_deep)
         # Source bought raws at THIS sub-assembly level too -- PIR + cost, mirroring the top-level
         # component block (~line 619). Closes the gap where a nested bought raw was created but never
         # sourced (no PIR/cost), so a multi-layer BOM is sourced everywhere a bought part sits.
-        if ch.get("role") == "bought" and ch.get("vendor") and cmat:
+        elif ch.get("role") == "bought" and ch.get("vendor") and cmat:
             _rp = float(ch["price"]) if ch.get("price") not in (None, "") else 0.01
             _rpir = _plain(create_info_record(cmat, ch["vendor"], net_price=_rp, confirm=True))
             report.append(f"      raw PIR {ch.get('name')}: {'ok' if 'Created' in _rpir else _rpir[:70]}")
@@ -418,9 +440,48 @@ def _build_made_subassembly(c: dict, plant: str, sp, report: list, created_raws:
     return sub
 
 
-def run_genesis(spec: dict, confirm: bool = False) -> str:
+def _preview_subtree(node, out, indent):
+    """Render a made node's children in the PREVIEW tree, RECURSIVELY to ANY depth. A made child is
+    noted as getting its OWN BOM/routing/PV, then its own sub-tree is rendered one level deeper --
+    so a 3- or 7-level structure shows every sub-assembly, matching what run_genesis actually builds."""
+    pad = "    " * indent
+    for ch in node.get("components") or []:
+        chex = _exists(ch.get("material"))
+        ktag = f"exists {ch.get('material')}" if chex else "CREATE"
+        deep = bool((ch.get("role") == "made" or ch.get("type") in ("HALB", "FERT")) and ch.get("components"))
+        src = (f"  -> PIR+cost @ {ch.get('vendor')}/{ch.get('price')}"
+               if ch.get("role") == "bought" and ch.get("vendor") else "")
+        flag = " ⚠ inferred" if ch.get("inferred") else ""
+        out.append(f"{pad}  └ {ch.get('name')}: [{ktag}] {ch.get('type', 'ROH')} x{ch.get('quantity', 1)}{src}{flag}")
+        if deep:
+            out.append(f"{pad}      ↳ own BOM + routing + production version (made sub-assembly)")
+            _preview_subtree(ch, out, indent + 1)
+
+
+class _EmitList(list):
+    """A `report` list that STREAMS each line the instant it's appended -- turns the silent deterministic
+    build into a LIVE per-object feed (material · PIR · cost · BOM · routing · PV) with no change to the ~900
+    append sites (run_genesis + _build_made_subassembly share this one list). on_step is the run_turn-style
+    callback; a hiccup in it must NEVER break the build."""
+    def __init__(self, on_step=None):
+        super().__init__()
+        self._on = on_step
+
+    def append(self, item):
+        super().append(item)
+        if self._on:
+            try:
+                self._on({"kind": "reasoning", "text": str(item)})
+            except Exception:
+                pass
+
+
+def run_genesis(spec: dict, confirm: bool = False, on_step=None) -> str:
     """Create a whole assembly's master data from a genesis spec (the heart of Design2Make):
     parent FERT -> component materials -> PIR+cost (bought) -> BOM -> routing.
+
+    on_step (optional): a run_turn-style callback -> each build step (material/PIR/cost/BOM/routing/PV)
+    streams live as it happens, so a big deterministic commit isn't a silent multi-minute block.
 
     MULTI-LEVEL: a made (HALB) component may carry its OWN "components" (its raws/sub-parts) and
     "routing"; run_genesis then builds that sub-assembly's BOM + routing + production version too, so
@@ -466,6 +527,26 @@ def run_genesis(spec: dict, confirm: bool = False) -> str:
         gres = {"kind": "genesis", "mode": "preview", "plant": plant, "parent": None,
                 "components": [], "bom": None, "routing": None, "production_version": None, "discipline": None}
         out = ["GENESIS PREVIEW -- nothing written. Confirm to create the full set."]
+        # ROLLUP across ALL levels -- so the WHOLE tree size is front-and-centre (e.g. "100 materials"),
+        # not just the FERT's direct children. Walks nested sub-assembly raws too.
+        def _walk(nodes):
+            for c in nodes:
+                yield c
+                yield from _walk(c.get("components") or [])
+        _all = list(_walk(comps))
+        _types = collections.Counter((c.get("type") or "?").upper() for c in _all)
+        if has_parent:
+            _types[(parent.get("type") or "FERT").upper()] += 1
+        _mat_total = sum(_types.values())
+        _made_sets = (1 if has_parent else 0) + sum(1 for c in _all if c.get("role") == "made" and c.get("components"))
+        _pir = sum(1 for c in _all if c.get("role") == "bought" and c.get("vendor"))
+        _cost = sum(1 for c in _all if c.get("role") == "bought" and c.get("price") not in (None, ""))
+        _order = ["FERT", "HALB", "HAWA", "ROH"]
+        _parts = [f"{_types[t]} {t}" for t in _order if _types.get(t)]
+        _parts += [f"{n} {t}" for t, n in _types.items() if t not in _order]
+        out.append(f"\nROLLUP (all levels): {_mat_total} materials  =  " + "  +  ".join(_parts))
+        out.append(f"  objects: {_made_sets} BOMs · {_made_sets} routings · {_made_sets} production versions"
+                   f"  ·  {_pir} PIRs · {_cost} cost conditions (every bought part, every level)")
         if has_parent:
             pex = _exists(parent.get("material"))
             pdd = None if pex else _dd(parent.get("description"))
@@ -496,27 +577,25 @@ def run_genesis(spec: dict, confirm: bool = False) -> str:
                  "type": c.get("type"), "role": c.get("role"), "quantity": c.get("quantity", 1),
                  "material": cmatp, "action": caction, "vendor": c.get("vendor"), "price": c.get("price"),
                  "dedup": cdd})
-            # MULTI-LEVEL preview: a MADE node may carry its own raws/sub-parts -> show them nested and
-            # note it gets its OWN BOM/routing/PV. The image can't show a HALB's raws, so anything the
-            # model INFERRED is flagged so the human vets it before confirm (the "infer + flag" design).
-            sub_children = c.get("components") or []
-            if c.get("role") == "made" and sub_children:
-                kids = []
-                for ch in sub_children:
-                    chex = _exists(ch.get("material"))
-                    chmat = ch.get("material") if chex else None
-                    ktag = f"exists {chmat}" if chex else "CREATE"
-                    flag = " ⚠ inferred" if ch.get("inferred") else ""
-                    out.append(f"      └ {ch.get('name')}: [{ktag}] {ch.get('type', 'ROH')} "
-                               f"x{ch.get('quantity', 1)}{flag}")
-                    kids.append({"name": ch.get("name"), "type": ch.get("type", "ROH"),
-                                 "quantity": ch.get("quantity", 1), "material": chmat,
-                                 "action": "exists" if chex else "create",
-                                 "inferred": bool(ch.get("inferred"))})
+            # MULTI-LEVEL preview: a MADE node carries its own sub-parts -> render the FULL sub-tree to
+            # ANY depth, noting each made node gets its OWN BOM/routing/PV (infer flags preserved).
+            if (c.get("role") == "made" or c.get("type") in ("HALB", "FERT")) and (c.get("components")):
                 out.append("        -> gets its OWN BOM + routing + production version (made sub-assembly)")
-                gres["components"][-1]["children"] = kids
+                _preview_subtree(c, out, 1)
                 gres["components"][-1]["subassembly"] = True
-        made_subs = [c for c in comps if c.get("role") == "made" and c.get("components")]
+                gres["components"][-1]["children"] = [
+                    {"name": ch.get("name"), "type": ch.get("type", "ROH"), "quantity": ch.get("quantity", 1),
+                     "material": ch.get("material"), "action": "exists" if _exists(ch.get("material")) else "create",
+                     "inferred": bool(ch.get("inferred"))} for ch in (c.get("components") or [])]
+
+        def _all_made(cs):                                # every made node WITH children, at ANY depth
+            acc = []
+            for x in cs:
+                if (x.get("role") == "made" or x.get("type") in ("HALB", "FERT")) and x.get("components"):
+                    acc.append(x)
+                    acc += _all_made(x.get("components"))
+            return acc
+        made_subs = _all_made(comps)
         if has_parent:
             tag = (f"  +{len(made_subs)} sub-assembly BOM/routing/production-version set(s)"
                    if made_subs else "")
@@ -529,7 +608,7 @@ def run_genesis(spec: dict, confirm: bool = False) -> str:
                            "routing + production version -> multi-level, born MRP-ready in ONE pass.")
         return _emit("\n".join(out), gres)
 
-    report = []
+    report = _EmitList(on_step)                       # commit path: every appended line streams live
     sp = Spine("genesis", plant=plant)               # 🛡 S0-S8 spine wraps every stage below
     gres = {"kind": "genesis", "mode": "complete", "plant": plant, "parent": None,
             "components": [], "bom": None, "routing": None, "production_version": None, "discipline": None}
@@ -899,10 +978,20 @@ def enable_plant_production(material: str, plant: str, components: list | None =
     # 4) BOM, 5) routing on the grounded work center, 6) production version
     results["bom_ok"] = _ok(r := create_bom(material, plant, comp_rows, confirm=True))
     report.append(f"BOM ({len(comp_rows)} comps): {'ok' if results['bom_ok'] else r[:160]}")
-    results["routing_ok"] = _ok(r := create_routing(
-        material, plant, [{"operation": "10", "text": "Final Assembly", "work_center": wc}],
-        description=f"{material} routing", confirm=True))
-    report.append(f"routing @ {wc}: {'ok' if results['routing_ok'] else r[:160]}")
+    # ROUTING has no natural key -- unlike the BOM (alt 1/usage 1) and production version (0001), a
+    # re-run of create_routing mints a BRAND NEW routing group every time, leaving duplicates behind
+    # (session 5fc3f68b: 3 retries of enable_plant_production -> 3 orphaned routing groups on one FERT).
+    # Check for an EXISTING routing FIRST; only create if none, so a retry is a safe no-op.
+    _existing_rt = json.loads(read_routing(material, plant) or "{}")
+    if _existing_rt.get("present") is True:
+        results["routing_ok"] = True
+        _grp = (_existing_rt.get("routings") or [{}])[0].get("group")
+        report.append(f"routing @ {wc}: reuse existing (group {_grp}) -- already present, not re-created")
+    else:
+        results["routing_ok"] = _ok(r := create_routing(
+            material, plant, [{"operation": "10", "text": "Final Assembly", "work_center": wc}],
+            description=f"{material} routing", confirm=True))
+        report.append(f"routing @ {wc}: {'ok' if results['routing_ok'] else r[:160]}")
     pv_ok, pv_msg = _create_production_version(material, plant, material)
     results["prodver_ok"] = pv_ok
     report.append(f"production version 0001: {'ok' if pv_ok else 'NOT bound'} -- {pv_msg[:140]}")

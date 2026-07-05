@@ -212,3 +212,42 @@ def verify_claim(claim_text, anchor=None, label="genesis-verifier", max_steps=14
          + scope + "--- DOER'S CLAIM ---\n" + (claim_text or "")),
         allowed_tools=VERIFIER_TOOLS, label=label, max_steps=max_steps, on_step=on_step)
     return parse_verdict(out)
+
+
+# How many materials one verifier turn can read back before its accumulated raw read-backs risk the
+# model's 128k context. A 150-material tree overflowed at 255k (session ba4a590c) -- so above this we
+# CHUNK. Conservative because reads are raw OData (the lens would raise this a lot). Tunable via env.
+VERIFY_BATCH = int(os.getenv("VERIFY_BATCH", "12"))
+
+
+def verify_claim_chunked(claim_text, anchor=None, label="genesis-verifier", on_step=None,
+                         batch_size=VERIFY_BATCH):
+    """Verify a LARGE anchor set in BATCHES so verification ALWAYS LANDS -- never a context overflow. Each
+    batch gets a SHORT synthetic claim + its own material subset (the anchor IS the authoritative scope, so
+    the full doer report -- itself huge -- is not re-sent per batch). Aggregates every batch into ONE
+    verdict and only concludes when all batches are done. Same return shape as verify_claim:
+    (passed, missing, unverified, verdict_text)."""
+    anchor = [str(a) for a in (anchor or [])]
+    if len(anchor) <= batch_size:                        # small enough -> a single normal pass
+        return verify_claim(claim_text, anchor=anchor, label=label, on_step=on_step)
+    batches = [anchor[i:i + batch_size] for i in range(0, len(anchor), batch_size)]
+    short = ("A doer completed a multi-level genesis (a FERT + HALB sub-assemblies + bought parts; each "
+             "made node has its own BOM/routing/production version, each bought part a PIR + cost). Verify "
+             "ONLY the in-scope batch below by reading SAP back.")
+    all_passed, tot_missing, tot_unver, verdicts = True, 0, 0, []
+    for bi, batch in enumerate(batches, 1):
+        if on_step:
+            try:
+                on_step({"kind": "phase", "text": f"verifying batch {bi}/{len(batches)} ({len(batch)} materials)…"})
+            except Exception:
+                pass
+        p, miss, unv, vtext = verify_claim(short, anchor=batch, label=f"{label}-b{bi}", on_step=on_step)
+        all_passed = all_passed and p
+        tot_missing += (miss or 0)
+        tot_unver += (unv or 0)
+        verdicts.append(f"— Batch {bi}/{len(batches)} ({len(batch)} mats): "
+                        + ("VERIFIED ✓" if p else f"{miss} MISSING") + (f", {unv} unverified" if unv else ""))
+    head = (f"VERIFICATION COMPLETE — {len(batches)} batches, {len(anchor)} materials: "
+            + ("ALL VERIFIED ✓" if (all_passed and not tot_missing) else
+               f"{tot_missing} MISSING" + (f", {tot_unver} unverified" if tot_unver else "")))
+    return all_passed, tot_missing, tot_unver, head + "\n" + "\n".join(verdicts)

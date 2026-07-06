@@ -1035,10 +1035,22 @@ def _product_header_types() -> dict:
 
 def _coerce(val, edm_type):
     """Format a value for the A_Product POST body by its $metadata Edm type. Booleans MUST be real JSON
-    booleans; everything else rides as a string (OData v2 JSON accepts string for Edm.Decimal/String/etc.)."""
+    booleans; numeric types (Decimal/Double/Int) must be PLAIN decimal strings -- Python's str() renders a
+    small float in SCIENTIFIC notation (str(2.74e-06) == '2.74e-06'), which SAP's OData Edm.Decimal parser
+    rejects with a 400, failing the whole deep-insert create (seen live: CAD estimated volumes ~1e-6 killed
+    the material create). Format those in fixed-point so the value lands. Everything else rides as a string."""
     t = (edm_type or "").lower()
     if "boolean" in t:
         return str(val).strip().lower() in ("true", "x", "1", "yes", "y", "t")
+    if any(n in t for n in ("decimal", "double", "single", "float", "int")):
+        try:
+            f = float(str(val).strip())
+            if "int" in t:
+                return str(int(round(f)))
+            s = f"{f:.12f}"                           # fixed-point @12dp, never scientific (2.74e-06 -> 0.00000274)
+            return s.rstrip("0").rstrip(".") if "." in s else s
+        except (TypeError, ValueError):
+            return str(val)
     return str(val)
 
 
@@ -1098,6 +1110,11 @@ def build_material_payload(
         US/UTXJ, Full tax) -- avoids SAP error MG/172.
     Resolve other coded values with list_allowed_values when unsure. Does NOT write.
     """
+    # B3 GUARD: plant DEFAULTS to the rig's plant so no create can silently omit the plant view (a
+    # basic-view-only material is unplannable -- the plant-extension regression). Pass plant="" (empty
+    # string) for an explicitly header-only payload; None means "not specified" -> default.
+    if plant is None:
+        plant = os.getenv("SAP_PLANT", "1710")
     fields = _build_material_payload(
         description=description, product_type=product_type, base_unit=base_unit,
         product_group=product_group, long_text=long_text, plant=plant,

@@ -239,19 +239,54 @@ def read_routing(material: str, plant: str = "1710") -> str:
 
 def _create_material(spec: dict, plant: str) -> tuple[str | None, str]:
     """Create one material (parent or component) via the verified payload builder.
-    FERT parents are born routable (procurement E + work-scheduling) and get a sales view."""
+    FERT parents are born routable (procurement E + work-scheduling) and get a sales view.
+
+    A spec node MAY carry explicit SAP classification -- product_group, valuation_class,
+    procurement_type, mrp_type, unit -- which are threaded to build_material_payload's existing
+    params so a source of record (e.g. a CAD part master, a BOM file) sets the REAL codes instead
+    of D2M's type-derived defaults. These are VIEW fields (plant/valuation) the attributes header
+    passthrough can't reach, so this is their only channel. Absent keys -> the defaults are
+    unchanged, so every existing spec builds byte-identically."""
     ptype = spec.get("type", "HAWA")
+    _opt = {}
+    if spec.get("product_group"):
+        _opt["product_group"] = str(spec["product_group"])
+    if spec.get("valuation_class"):
+        _opt["valuation_class"] = str(spec["valuation_class"])
+    if spec.get("procurement_type"):
+        _opt["procurement_type"] = str(spec["procurement_type"])
+    if spec.get("mrp_type"):
+        _opt["mrp_type"] = str(spec["mrp_type"])
+    if spec.get("unit"):
+        _opt["base_unit"] = str(spec["unit"])
     built = json.loads(build_material_payload(
         description=(spec.get("description") or spec.get("name") or "Material")[:40],
         product_type=ptype, plant=plant,
         sales_org="1710" if ptype == "FERT" else None,
         extra_fields=spec.get("attributes"),        # $metadata-validated passthrough: weights, dims, etc.
+        **_opt,                                      # explicit SAP classification when the spec carries it
     ))
     payload, notes = built["fields"], built.get("extra_notes") or []
     res = create_material(fields=payload, confirm=True)
+    mat = _new_matnr(res)
+    # RESILIENCE: an OPTIONAL engineering attribute must never cost us the material. If the deep-insert
+    # was rejected (no matnr) AND we sent passthrough attributes, retry ONCE with a clean base payload
+    # (no extra_fields) so the material is still created -- and say which attributes were dropped. The
+    # passthrough's contract is "a bad attribute is skipped, never breaks the create"; this makes that
+    # hold for a bad VALUE (e.g. a unit SAP won't accept), not just a bad field name.
+    if not mat and spec.get("attributes"):
+        base = json.loads(build_material_payload(
+            description=(spec.get("description") or spec.get("name") or "Material")[:40],
+            product_type=ptype, plant=plant,
+            sales_org="1710" if ptype == "FERT" else None, **_opt))   # NO extra_fields this time
+        res2 = create_material(fields=base["fields"], confirm=True)
+        mat = _new_matnr(res2)
+        if mat:
+            res = f"{res2}  [attrs DROPPED after create was rejected with them: {list(spec['attributes'].keys())}]"
+            return mat, res
     if notes:                                        # surface which extra fields were set / skipped
         res = f"{res}  [attrs: {'; '.join(notes)}]"
-    return _new_matnr(res), res
+    return mat, res
 
 
 # ---- semantic DEDUP at the very start (scoped) + write-back -----------------
@@ -456,6 +491,39 @@ def _preview_subtree(node, out, indent):
         if deep:
             out.append(f"{pad}      ↳ own BOM + routing + production version (made sub-assembly)")
             _preview_subtree(ch, out, indent + 1)
+
+
+def _reconcile_created(parent: dict | None, comps: list, pmat, has_parent: bool) -> dict:
+    """B1 -- the maker reconciles its OWN create-loop before claiming done. Deterministic count of the
+    spec nodes this run RECEIVED vs the nodes that ended the run with a material number (the loops write
+    each created/reused number back into its node; a failed/skipped node stays bare). Any gap is a typed
+    IncompleteCreation -- a partial create is an INCOMPLETE state, never a silent success. (This checks
+    the spec run_genesis received; the Verifier's manifest reconciliation additionally catches a spec
+    that arrived already truncated/flattened.)"""
+    def _walk(nodes):
+        for n in nodes or []:
+            yield n
+            yield from _walk(n.get("components"))
+    planned_nodes = list(_walk(comps))
+    missing = [str(n.get("name") or n.get("description") or "?")
+               for n in planned_nodes if not n.get("material")]
+    planned = len(planned_nodes) + (1 if has_parent else 0)
+    if has_parent and not pmat:
+        missing.insert(0, str((parent or {}).get("description") or "parent"))
+    created = planned - len(missing)
+    return {"kind": "IncompleteCreation" if missing else "reconciled",
+            "planned": planned, "created": created, "missing": missing, "complete": not missing}
+
+
+def _recon_lines(recon: dict) -> str:
+    """Render the maker's self-reconciliation as report lines (INCOMPLETE names every missing node)."""
+    if recon["complete"]:
+        return f"\nRECONCILED: created {recon['created']}/{recon['planned']} planned materials ✓"
+    lines = [f"\n⛔ INCOMPLETE CREATION: created {recon['created']}/{recon['planned']} planned materials — "
+             f"{len(recon['missing'])} MISSING:"]
+    lines += [f"  MISSING {m}" for m in recon["missing"]]
+    lines.append("Do NOT treat this genesis as complete. The missing nodes were never created.")
+    return "\n".join(lines)
 
 
 class _EmitList(list):
@@ -736,8 +804,17 @@ def run_genesis(spec: dict, confirm: bool = False, on_step=None) -> str:
     #      run stops here: the parts + their PIR/cost exist; there is nothing to assemble or plan-bind.
     if not has_parent:
         report.append("(components-only -- no BOM / routing / production version)")
+        recon = _reconcile_created(None, comps, None, False)          # B1: reconcile BEFORE any "complete"
+        gres["reconciliation"] = recon
         gres["discipline"] = _discipline_summary(sp.finalize())
-        return _emit("GENESIS COMPLETE (components only):\n" + "\n".join(report) + _dossier(sp.finalize()), gres)
+        if not recon["complete"]:
+            gres["incomplete"] = recon
+            return _emit(f"GENESIS INCOMPLETE (components only) -- created {recon['created']}/"
+                         f"{recon['planned']} planned materials:\n" + "\n".join(report)
+                         + _recon_lines(recon) + _dossier(sp.finalize()), gres)
+        return _emit("GENESIS COMPLETE (components only, reconciled "
+                     f"{recon['created']}/{recon['planned']}):\n" + "\n".join(report)
+                     + _recon_lines(recon) + _dossier(sp.finalize()), gres)
 
     # 3) BOM (parent + components) -------------------------------------------
     if comp_rows:
@@ -804,7 +881,16 @@ def run_genesis(spec: dict, confirm: bool = False, on_step=None) -> str:
 
     final = sp.finalize()
     gres["discipline"] = _discipline_summary(final)
-    return _emit(f"GENESIS COMPLETE for {pmat}:\n" + "\n".join(report)
+    recon = _reconcile_created(parent, comps, pmat, has_parent)       # B1: reconcile BEFORE any "complete"
+    gres["reconciliation"] = recon
+    if not recon["complete"]:
+        gres["incomplete"] = recon
+        return _emit(f"GENESIS INCOMPLETE for {pmat} -- created {recon['created']}/{recon['planned']} "
+                     f"planned materials ({len(recon['missing'])} MISSING):\n" + "\n".join(report)
+                     + _recon_lines(recon) + _dossier(final), gres)
+    return _emit(f"GENESIS COMPLETE for {pmat} (reconciled {recon['created']}/{recon['planned']}):\n"
+                 + "\n".join(report)
+                 + _recon_lines(recon)
                  + _dossier(final), gres)            # S6/S8 persist + roll-up, then append the dossier
 
 

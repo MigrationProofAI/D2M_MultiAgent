@@ -227,8 +227,12 @@ def apply(tools: dict) -> dict:
     for name, (server, ctool, adapt) in ROUTES.items():
         if name in out:
             _fn, spec = out[name]
-            post = _norm_create if name == "create_material" else None
-            out[name] = (_wrap(server, ctool, adapt, post), spec)
+            if name == "create_material":
+                # the guarded shim (B3): create + verify/re-issue the plant view, one path for the
+                # registry tool AND genesis's direct rebinding -- the seam cannot drift apart again.
+                out[name] = ((lambda **kw: s_create_material(kw.get("fields"), bool(kw.get("confirm")))), spec)
+                continue
+            out[name] = (_wrap(server, ctool, adapt, None), spec)
     return out
 
 
@@ -255,9 +259,52 @@ def s_get_material(material, full=False):
     return call("material", "read_material", {"material": str(material)})
 
 
+def _plant_view_of(fields):
+    """(plant, mrp_type, procurement_type) the payload's to_Plant deep-insert intends, or (None, ..)."""
+    try:
+        row = ((fields or {}).get("to_Plant") or {}).get("results") or []
+        row = row[0] if row else {}
+        return (str(row.get("Plant") or "") or None,
+                str(row.get("MRPType") or "PD"), row.get("ProcurementType"))
+    except Exception:
+        return None, "PD", None
+
+
+def _ensure_cloud_plant_view(res, fields):
+    """B3 GUARD -- the plant-extension wiring the CF route can silently drop. The cloud
+    change_material(add) is NOT yet live-verified to deep-insert the nested to_Plant/to_Valuation
+    (module STATUS above): if it only POSTs the A_Product header, every CF-created material is born
+    MARA-basic-only -- the regression. So after a create whose payload INTENDED a plant view, read the
+    material back; unless the read positively shows that plant's view, re-issue extend_to_plant
+    explicitly (idempotent-safe: an 'already exists' rejection means the view was there)."""
+    mat = _extract_matnr(res)
+    plant, mrp_type, proc = _plant_view_of(fields)
+    if not mat or not plant:
+        return res
+    back = call("material", "read_material", {"material": mat})
+    canon = re.sub(r"\s+", "", str(back)).replace("'", '"')
+    if f'"Plant":"{plant}"' in canon:
+        return res                                    # deep-insert confirmed -- the view landed
+    ext = s_extend_to_plant(mat, plant, product_type=str((fields or {}).get("ProductType") or "ROH"),
+                            mrp_type=mrp_type, procurement_type=proc, confirm=True)
+    if re.search(r"already exist|duplicate", str(ext), re.I):
+        note = f"[plant view @{plant}: present (extend reported already-exists)]"
+    elif re.search(r"error|failed", str(ext), re.I):
+        note = f"[⚠ plant view @{plant} NOT confirmed: create echo lacked it and extend_to_plant failed -- {str(ext)[:160]}]"
+    else:
+        note = f"[plant view @{plant}: re-issued via extend_to_plant (cloud add did not deep-insert it)]"
+    return f"{res}\n{note}"
+
+
 def s_create_material(fields, confirm=False):   # grounded deep-insert -> cloud change_material add
-    return _norm_create(call("material", "change_material",
+    res = _norm_create(call("material", "change_material",
                 {"entity": "A_Product", "keys": {}, "fields": fields, "operation": "add", "confirm": bool(confirm)}))
+    if confirm:
+        try:
+            res = _ensure_cloud_plant_view(res, fields)
+        except Exception:
+            pass
+    return res
 
 
 def s_extend_to_plant(material, plant, product_type="ROH", mrp_type="ND", procurement_type=None,

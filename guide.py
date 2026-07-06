@@ -23,6 +23,33 @@ def is_platform_question(text: str) -> bool:
     return bool(_PLATFORM_RE.search(text or ""))
 
 
+# COMPLETION / VERIFICATION questions ("did everything get created?", "is it all there?", "ensure all
+# objects were created") are NOT platform questions and NOT build commands -- they are a demand for a
+# COMPLETION VERDICT, and only the Verifier's manifest reconciliation may produce one. Dispatch checks
+# this BEFORE the Guide (which narrates but cannot verify) and before genesis/planning (whose keywords
+# a phrase like "is everything for the laptop created?" would otherwise hijack). Kept strict enough not
+# to catch imperatives ("go ahead, create them all" must still commit, not reconcile).
+_COMPLETION_RE = re.compile(
+    r"(?:"
+    #  is/was/did/has … all/everything/complete/missing … created/there/built/in sap/present/exist/correct
+    r"\b(?:is|are|was|were|did|do|does|has|have|check|verify|confirm|ensure|make\s+sure|validate|audit)\b"
+    r"[^?.!;]{0,80}?"
+    r"\b(?:all|everything|every\s+\w+|complete(?:d|ly)?|fully|nothing\s+missing|anything\s+missing|\d+\s+(?:parts|materials|objects|components))\b"
+    r"[^?.!;]{0,80}?"
+    r"\b(?:created?|built|there|in\s+sap|made\s+it|exists?|present|generated|posted|correct(?:ly)?|accounted)\b"
+    r"|\bis\s+(?:it|this|that|everything)\s+(?:all\s+)?(?:there|complete|created|done|correct)\b"
+    r"|\b(?:anything|something|what(?:'s|\s+is))\s+missing\b"
+    r"|\breconcil\w*\b"
+    r"|\b(?:all|everything)\s+(?:created|there|in\s+sap|accounted\s+for)\s*\?"
+    r")", re.I)
+
+
+def is_completion_question(text: str) -> bool:
+    """True when the user is asking for a COMPLETION/VERIFICATION verdict. Routed to the Verifier's
+    manifest reconciliation at dispatch -- never answered by the Guide's narration or a doer's optimism."""
+    return bool(_COMPLETION_RE.search(text or ""))
+
+
 GUIDE_PERSONA = (
     "You are the voice and guide of Design2Make — a warm, concise product expert, like a friendly demo "
     "host. You ONLY explain the TOOL and its architecture; you never create or change SAP data and you "
@@ -42,5 +69,10 @@ GUIDE_PERSONA = (
     "- The brain is Claude Sonnet 4.6 running on SAP AI Core, so there's no out-of-pocket model spend, and "
     "everything is transparent: each agent's reasoning and actions stream in the Agent Activity panel.\n\n"
     "If someone asks for an actual master-data task (create, extend, run MRP), gently say you're the guide "
-    "and they can ask the system to run it. Keep every answer brief, human, and easy on the ear."
+    "and they can ask the system to run it. Keep every answer brief, human, and easy on the ear.\n\n"
+    "HARD RULE — you NEVER certify completion. If asked whether everything was created / is all there / "
+    "is correct, do not answer yes or no: you have no SAP tools, so you cannot know. Say that only the "
+    "Verifier's manifest reconciliation can answer that, and that the system runs it independently — then "
+    "stop. A completion verdict from you would be a claim without a read-back, and this platform never "
+    "does that."
 )

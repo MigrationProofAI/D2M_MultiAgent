@@ -41,8 +41,13 @@ def _walk(spec):
     def rec(n, depth, mult, top):
         q = float(n.get("quantity", 1) or 1)
         m = mult * q
-        made = bool(n.get("components"))
+        # made/bought mirrors run_genesis: it keys PIR/cost on ROLE, not on having children. So a flat
+        # made node (a CAD HALB with no sub-parts) is MADE (no PIR), not bought. Fall back to
+        # children-presence only when the spec node carries no explicit role (older specs).
+        role = str(n.get("role") or "").lower()
+        made = (role == "made") if role in ("made", "bought") else bool(n.get("components"))
         out.append({"node": n, "depth": depth, "mult": m, "made": made,
+                    "sub": made and bool(n.get("components")),   # a made SUB-ASSEMBLY: own BOM/routing/PV
                     "system": top or n.get("name")})
         for c in (n.get("components") or []):
             rec(c, depth + 1, m, top or n.get("name"))
@@ -58,15 +63,15 @@ def _material_contract(has_attrs):
         ("Basic Data", "ProductType", "<row type>", "file:type"),
         ("Basic Data", "ProductDescription", "<row description> (≤40)", "file:description"),
         ("Basic Data", "BaseUnit", "<row unit, else EA>", "file:unit / default"),
-        ("Basic Data", "ProductGroup", "50101001", "default:genesis"),
+        ("Basic Data", "ProductGroup", "01 (neutral) or a mapped code", "file:part_master else default 01"),
         ("Basic Data", "IndustrySector", "M", "default:genesis"),
-        ("Plant / MRP", "MRPType", "PD", "default:genesis"),
-        ("Plant / MRP", "ProcurementType", "E if made else F", "derived:role"),
+        ("Plant / MRP", "MRPType", "PD", "file:planning else default"),
+        ("Plant / MRP", "ProcurementType", "E/F", "file:part_master else derived:role"),
         ("Plant / MRP", "MRPResponsible", "001", "default:genesis"),
         ("Plant / MRP", "AvailabilityCheckType", "02", "default:genesis"),
         ("Plant / MRP", "LotSizingProcedure", "EX", "default:genesis"),
         ("Plant / MRP", "PlannedDeliveryDurationInDays", "10", "default:genesis"),
-        ("Valuation", "ValuationClass", "by type (ROH 3000 / HAWA 3100 / HALB 7900 / FERT 7920)", "derived:type"),
+        ("Valuation", "ValuationClass", "by type (ROH 3000 / HAWA 3100 / HALB 7900 / FERT 7920)", "file:part_master else derived:type"),
         ("Valuation", "StandardPrice", "100.00", "default:genesis"),
         ("Valuation", "Currency", "USD", "default:genesis"),
         ("Sales (FERT only)", "SalesOrg / DistrChannel", "1710 / 10", "default:genesis"),
@@ -130,9 +135,17 @@ def _flags(inst, spec):
         flags.append(("warn", f"{len(np)} bought part(s) with NO price → cost condition will default"))
     if nv:
         flags.append(("bad", f"{len(nv)} bought part(s) with NO vendor → no PIR/cost will be created"))
-    mnr = [i for i in made if not i["node"].get("routing")]
-    if mnr:
-        flags.append(("info", f"{len(mnr)} made node(s) have no explicit routing → default Assembly+Packaging"))
+    # A made SUB-ASSEMBLY (has children) with no explicit routing gets D2M's default operations.
+    subs_no_rt = [i for i in made if i.get("sub") and not i["node"].get("routing")]
+    if subs_no_rt:
+        flags.append(("info", f"{len(subs_no_rt)} made sub-assembly(ies) have no explicit routing → default Assembly+Packaging"))
+    # A flat made LEAF (made in-house but no sub-parts, e.g. a single-level CAD HALB) is created as a
+    # material in the parent BOM but gets NO BOM/routing/production version of its own -- so it is not
+    # independently producible until decomposed. This is honest to surface before commit.
+    made_leaf = [i for i in made if not i.get("sub")]
+    if made_leaf:
+        flags.append(("info", f"{len(made_leaf)} made component(s) have no sub-structure → created as "
+                              f"semi-finished in the BOM, but not independently producible (no own BOM/routing/PV)"))
     prices = [float(i["node"]["price"]) for i in bought if i["node"].get("price") not in (None, "")]
     if len(prices) >= 8:
         med = statistics.median(prices)
@@ -161,6 +174,8 @@ def plan_report(spec, plant="1710"):
     inst = _walk(spec)
     made = [i for i in inst if i["made"]]
     bought = [i for i in inst if not i["made"]]
+    subs = [i for i in inst if i["sub"]]                    # made sub-assemblies (own BOM/routing/PV)
+    has_parent = bool((spec.get("parent") or {}).get("description") or (spec.get("parent") or {}).get("material"))
     depth = max((i["depth"] for i in inst), default=0)
     total = sum(float(i["node"]["price"]) * i["mult"]
                 for i in bought if i["node"].get("price") not in (None, ""))
@@ -172,9 +187,16 @@ def plan_report(spec, plant="1710"):
     has_attrs = any(i["node"].get("attributes") for i in inst)
     flags = _flags(inst, spec)
 
-    counts = {"materials": len(inst) + 1, "made": len(made) + 1, "bought": len(bought), "depth": depth,
-              "boms": len(made) + 1, "routings": len(made) + 1, "prod_versions": len(made) + 1,
-              "pirs": len(bought), "costs": len(bought)}
+    # Structure objects (BOM + routing + production version) are created for the FERT parent and for
+    # each MADE SUB-ASSEMBLY (a made node with its own children) -- NOT for a flat childless made node.
+    # PIR/cost are created only for a bought part that actually carries a vendor/price. This mirrors
+    # run_genesis exactly, so the card predicts what the commit will really write.
+    n_struct = len(subs) + (1 if has_parent else 0)
+    counts = {"materials": len(inst) + (1 if has_parent else 0),
+              "made": len(made) + (1 if has_parent else 0), "bought": len(bought), "depth": depth,
+              "boms": n_struct, "routings": n_struct, "prod_versions": n_struct,
+              "pirs": sum(1 for i in bought if i["node"].get("vendor")),
+              "costs": sum(1 for i in bought if i["node"].get("price") not in (None, ""))}
     contract = {
         "Materials": _material_contract(has_attrs),
         "Purchase Info Records": _PIR_CONTRACT,
@@ -195,18 +217,24 @@ def plan_report(spec, plant="1710"):
     costs = [{"part": i["node"].get("name"), "rate": i["node"].get("price"),
               "condition": "PPR0", "vendor": i["node"].get("vendor")}
              for i in bought if i["node"].get("price") not in (None, "")]
-    boms = [{"parent": i["node"].get("name"), "type": i["node"].get("type"), "usage": "1", "alt": "01",
-             "components": [{"name": c.get("name"), "qty": c.get("quantity", 1)}
-                            for c in (i["node"].get("components") or [])]}
-            for i in made]
-    routings = [{"node": i["node"].get("name"),
+    # BOM/routing/PV rows: the FERT parent (its components are the top-level list) + each made
+    # sub-assembly. A flat made node (no children) gets NO structure row -- matching the commit.
+    _struct_src = ([{"node": spec.get("parent") or {}, "components": spec.get("components") or [],
+                     "routing": spec.get("routing")}] if has_parent else []) + \
+                  [{"node": i["node"], "components": i["node"].get("components") or [],
+                    "routing": i["node"].get("routing")} for i in subs]
+    boms = [{"parent": s["node"].get("name") or s["node"].get("description"),
+             "type": s["node"].get("type", "FERT"), "usage": "1", "alt": "01",
+             "components": [{"name": c.get("name"), "qty": c.get("quantity", 1)} for c in s["components"]]}
+            for s in _struct_src]
+    routings = [{"node": s["node"].get("name") or s["node"].get("description"),
                  "operations": [{"op": o.get("operation"), "wc": o.get("work_center"), "text": o.get("text")}
-                                for o in (i["node"].get("routing") or [])] or
+                                for o in (s["routing"] or [])] or
                                 [{"op": "10", "wc": "ASSEMBLY", "text": "Final Assembly (default)"},
                                  {"op": "20", "wc": "PACK01", "text": "Packaging (default)"}]}
-                for i in made]
-    pvs = [{"node": i["node"].get("name"), "version": "0001", "binding": "alt 01 / usage 1", "lot": "1-10000"}
-           for i in made]
+                for s in _struct_src]
+    pvs = [{"node": s["node"].get("name") or s["node"].get("description"), "version": "0001",
+            "binding": "alt 01 / usage 1", "lot": "1-10000"} for s in _struct_src]
     work_centers = sorted({o["wc"] for r in routings for o in r["operations"] if o.get("wc")})
     # PRE-COMMIT work-center validity: flag routings planned on work centers not valid for task-list type N.
     _bad_wc = _routing_invalid_wcs(plant)

@@ -35,6 +35,53 @@ def _spec(name, desc, props, required):
         "parameters": {"type": "object", "properties": props, "required": required}}}
 
 
+def _anchor_genesis(spec, confirm, result):
+    """SESSION-ANCHOR capture (typed state, deterministic): a genesis PREVIEW anchors the DECLARED
+    manifest (what the human approves); a COMMIT anchors the FG number + created ledger. Captured HERE,
+    at the tool layer, from the FULL spec/result -- never mined from the 8000-char-truncated text the
+    model sees. Best-effort: an anchor write must never break a build."""
+    try:
+        import anchors as _anch
+        if _CURRENT_SESSION is None or not isinstance(spec, dict):
+            return
+        if confirm:
+            _anch.record_commit(_CURRENT_SESSION.dir, spec, result)
+        else:
+            _anch.record_preview(_CURRENT_SESSION.dir, spec)
+    except Exception:
+        pass
+
+
+def run_genesis_anchored(spec: dict, confirm: bool = False, on_step=None) -> str:
+    """run_genesis + session-anchor capture (the registry binds THIS, so image genesis anchors too)."""
+    out = run_genesis(spec, confirm=confirm, on_step=on_step)
+    _anchor_genesis(spec, bool(confirm), out)
+    return out
+
+
+def _anchored_planning(fn):
+    """SESSION-ANCHOR arg-fill for the PLANNING tools (deterministic, not model obedience): when the
+    model omits material/plant -- or passes a placeholder like 'FG' / the product name instead of a
+    number -- the TOOL LAYER substitutes the anchored FG material and plant from typed session state.
+    'Create demand for the FG and run MRP' then cannot re-ask and cannot mis-remember, no matter how
+    long the session is. An explicit NUMERIC material (this rig's materials are numeric) is always
+    respected -- the user may plan a different product."""
+    def _filled(**kw):
+        try:
+            import anchors as _anch
+            a = _anch.read(_CURRENT_SESSION.dir) if _CURRENT_SESSION is not None else None
+            if a is not None:
+                m = str(kw.get("material") or "").strip()
+                if a.fg_material and not m.isdigit():          # absent or a non-numeric placeholder
+                    kw["material"] = a.fg_material
+                if a.plant and not str(kw.get("plant") or "").strip():
+                    kw["plant"] = a.plant
+        except Exception:
+            pass
+        return fn(**kw)
+    return _filled
+
+
 def load_bom_from_file(path: str, confirm: bool = False, enrich: bool = False, on_step=None) -> str:
     """Drive genesis DETERMINISTICALLY from a tabbed-Excel BOM file (no vision model): parse the
     workbook into a genesis spec, then run the same run_genesis write-chain. confirm=false previews.
@@ -72,13 +119,16 @@ def load_bom_from_file(path: str, confirm: bool = False, enrich: bool = False, o
     if not confirm:
         # PREVIEW: a decision-grade PLAN REPORT (deterministic contract + cost + flags), not a raw tree dump.
         # This is what the board reasons on and the user approves; web.py renders the tabbed Genesis Plan card.
+        _anchor_genesis(spec, False, "")               # anchor the DECLARED manifest at preview time
         try:
             from plan_report import plan_report
             pr = plan_report(spec, (spec.get("parent") or {}).get("plant") or "1710")
             return enrich_head + head + pr["summary"]
         except Exception as e:
             return enrich_head + head + str(run_genesis(spec, confirm=False)) + f"\n(plan report unavailable: {e})"
-    return enrich_head + head + str(run_genesis(spec, confirm=True, on_step=on_step))
+    out = str(run_genesis(spec, confirm=True, on_step=on_step))
+    _anchor_genesis(spec, True, out)                   # anchor FG + created ledger at commit time
+    return enrich_head + head + out
 
 
 def reconcile_routings(bom_file: str, fert: str, plant: str = "1710") -> str:
@@ -254,7 +304,9 @@ TOOLS = {
 
     "build_material_payload": (build_material_payload, _spec(
         "build_material_payload",
-        "Assemble a verified create payload (returns {fields}). Smart defaults baked in; pass plant for a plant view.",
+        "Assemble a verified create payload (returns {fields}). Smart defaults baked in. The plant view is "
+        "ALWAYS included: plant defaults to the rig's plant (SAP_PLANT, 1710) so no material is ever born "
+        "basic-view-only; pass plant to override, or plant='' (empty) for an explicitly header-only payload.",
         {"description": {"type": "string"}, "product_type": {"type": "string", "description": "ROH|HAWA|HALB|FERT"},
          "base_unit": {"type": "string"}, "product_group": {"type": "string"},
          "plant": {"type": "string"}, "sales_org": {"type": "string"}},
@@ -444,7 +496,7 @@ TOOLS = {
         "find_field", "Resolve a user's term to the exact OData field name from live $metadata.",
         {"term": {"type": "string"}}, ["term"])),
 
-    "run_genesis": (run_genesis, _spec(
+    "run_genesis": (run_genesis_anchored, _spec(
         "run_genesis", "Design2Make: create a whole assembly's master data from a spec (parent FERT -> "
         "components -> PIR/cost for bought -> BOM -> routing -> production version). confirm=false "
         "PREVIEWS the plan (no writes); confirm=true COMMITS. Build the spec from the image; do NOT "
@@ -567,7 +619,7 @@ TOOLS = {
          "currency": {"type": "string"}, "purchasing_org": {"type": "string"},
          "confirm": {"type": "boolean"}}, ["material", "supplier", "price"])),
 
-    "create_demand": (create_demand, _spec(
+    "create_demand": (_anchored_planning(create_demand), _spec(
         "create_demand", "Create Planned Independent Requirements (forecast) DEMAND for a make-to-stock "
         "finished good — type VSF/version 00 via API_PLND_INDEP_RQMT_SRV (the make-to-stock signal MRP "
         "consumes, NOT a sales order). Runs on the remote mcp-demand server (:8003). For ONE month set "
@@ -582,13 +634,13 @@ TOOLS = {
          "period_to": {"type": "string", "description": "END YYYYMM; set with period to write one bucket per month across the span in ONE call"},
          "confirm": {"type": "boolean"}}, ["material"])),
 
-    "read_demand": (read_demand, _spec(
+    "read_demand": (_anchored_planning(read_demand), _spec(
         "read_demand", "READ existing Planned Independent Requirements (header + per-period quantities) "
         "for a material+plant from API_PLND_INDEP_RQMT_SRV (mcp-demand :8003). Use to VERIFY that demand "
         "actually persisted. An empty result means NO PIR demand exists yet for that material.",
         {"material": {"type": "string"}, "plant": {"type": "string"}}, ["material"])),
 
-    "run_mrp": (run_mrp, _spec(
+    "run_mrp": (_anchored_planning(run_mrp), _spec(
         "run_mrp", "Run MRP for a material and return the planned cascade (planned orders + purchase reqs "
         "per BOM level). multi_level=true plans the whole BOM (MD02); false = header only (MD03). Runs on "
         "the remote NWRFC planning server. confirm=false PREVIEWS; confirm=true COMMITS. An ERROR about "
@@ -598,7 +650,7 @@ TOOLS = {
          "planning_mode": {"type": "string", "description": "'1'=adapt (normal), '3'=delete & recreate (demo)"},
          "confirm": {"type": "boolean"}}, ["material"])),
 
-    "read_mrp_list": (read_mrp_list, _spec(
+    "read_mrp_list": (_anchored_planning(read_mrp_list), _spec(
         "read_mrp_list", "READ the MD04 stock/requirements list for a material — every supply & demand "
         "element the MRP run PRODUCED: plant stock, planned orders, purchase requisitions, planned "
         "independent requirements, sales orders, dependent requirements — each with date, quantity and "
@@ -608,7 +660,7 @@ TOOLS = {
         {"material": {"type": "string"}, "plant": {"type": "string"},
          "area": {"type": "string", "description": "MRP area; defaults to plant"}}, ["material"])),
 
-    "read_mrp_material": (read_mrp_material, _spec(
+    "read_mrp_material": (_anchored_planning(read_mrp_material), _spec(
         "read_mrp_material", "READ the MRP material master for a material @ plant: procurement type "
         "(E in-house / F external), low-level code, base unit, material type/group, MRP area. Read-only "
         "(mcp-mrp :8004).",

@@ -22,12 +22,13 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from fastapi import FastAPI, WebSocket
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
 from session import Session, SESSIONS_DIR
 from session_title import ensure_title, cached_title
 import session_meta
+import anchors as session_anchors                     # typed SESSION ANCHORS: FG / plant / manifest / ledger
 import s3_store
 from memory import TieredMemory, ntok
 from skills import SkillRegistry
@@ -54,8 +55,9 @@ from orchestrate import ORCHESTRATE_ON, verify_claim, verify_claim_chunked, suba
 from object_verifier import verify_genesis_objects   # deterministic genesis gate: ~0 tokens, no context limit
 import verification_cards                             # render verifier output as Structured-Data cards (in Python)
 from boardroom import convene_board, _verdict_of
-from guide import is_platform_question, GUIDE_PERSONA
+from guide import is_platform_question, is_completion_question, GUIDE_PERSONA
 from planner import PLANNER_PERSONA, is_planning
+import cad_design                                       # UNIFIED flow: D2M drives AgentCAD (design/2D/3D) as a backend
 import tts
 
 # Convene the cross-functional board on a genesis PREVIEW (before the human confirms). On by default when
@@ -166,7 +168,7 @@ def _created_materials(steps) -> list:
     return sorted(create_nums - web_nums - _NON_MATERIAL_NUMS)
 
 
-_GAP_OBJ = re.compile(r"(routing|production[- ]?version|prod\.? ?ver|BOM|PIR|price|CountryOfOrigin|material)", re.I)
+_GAP_OBJ = re.compile(r"(routing|production[- ]?version|prod\.? ?ver|BOM|PIR|price|CountryOfOrigin|plant[- ]?view|material)", re.I)
 
 
 def _gap_summary(verdict, limit=4):
@@ -219,7 +221,9 @@ def _heal_prompt(verdict: str, steer_notes=None) -> str:
         "net_price=...) THEN create_cost_condition(material, supplier, price=...) — only for THIS build's "
         "new materials, with the component's vendor (default 17300001) and its price. For a missing "
         "ROUTING or PRODUCTION VERSION on a made material (a HALB sub-assembly), call "
-        "enable_plant_production(material=<the HALB>, plant=<plant>). "
+        "enable_plant_production(material=<the HALB>, plant=<plant>). For a missing PLANT VIEW "
+        "(a material born basic-view-only), call extend_to_plant(material, plant, product_type=<its type>, "
+        "mrp_type='PD', confirm=true) — every created material must carry its plant view. "
         "PRICE GAP on an EXISTING info record (NetPriceAmount reads ~0.01, and it is NOT marked MISSING): do "
         "NOT re-create it — a second POST of an info record that already exists FAILS ('Address texts do not "
         "exist'). Correct the purchasing condition via set_condition_price / change_cost_condition WITH the "
@@ -310,11 +314,16 @@ def _cards(steps):
     return out
 
 
-# ---- serve the built React app ----
+# ---- root serves the UNIFIED Studio (the warm-paper 3-pane app) ----
 @app.get("/")
 def index():
-    # never cache index.html -> a rebuild (new hashed bundle name) is picked up on the next load, so a
-    # stale cached index can't point at a deleted bundle and blank the UI. The hashed assets stay cached.
+    # :9100 IS the Studio now — the merged Ideate->Design->Make->Plan app. The old React bundle is at /legacy.
+    return FileResponse(HERE / "studio.html", headers={"Cache-Control": "no-cache, must-revalidate"})
+
+
+@app.get("/legacy")
+def legacy():
+    # the previous built React UI, kept reachable. never cache its index (hashed-bundle rebuilds).
     return FileResponse(STATIC / "index.html", headers={"Cache-Control": "no-cache, must-revalidate"})
 
 
@@ -324,6 +333,30 @@ def intro():
     # + a diagram that builds as it narrates). Lives beside web.py (stable -- NOT in static_v2, which the
     # frontend build wipes). Same-origin, so it reuses /api/tts for the cached nova narration.
     return FileResponse(HERE / "intro.html", headers={"Cache-Control": "no-cache, must-revalidate"})
+
+
+@app.get("/studio")
+def studio():
+    # The UNIFIED Studio: the warm-paper 3-pane UI (Conversation | Agent Activity | Part Lineage), the
+    # locked design language for the merged Ideate->Design->Make->Plan app. Self-contained, lives beside
+    # web.py (stable, NOT in static_v2). Speaks the same WS + session REST as the React app.
+    return FileResponse(HERE / "studio.html", headers={"Cache-Control": "no-cache, must-revalidate"})
+
+
+@app.get("/cadviewer/{slug}")
+def cadviewer(slug):
+    """SAME-ORIGIN proxy of AgentCAD's self-contained interactive 3D viewer (viewer.html — rotate/explode/
+    home, geometry built inline from assembly_spec.json + three.js from CDN). Proxying the HTML means the
+    Studio can frame it same-origin (:9100), so the 3D renders reliably with no cross-origin framing doubt."""
+    import urllib.request
+    base = os.getenv("AGENTCAD_URL", "http://127.0.0.1:5005").rstrip("/")
+    try:
+        with urllib.request.urlopen(f"{base}/viewer/{slug}/", timeout=15) as r:
+            html = r.read().decode("utf-8", "replace")
+        return HTMLResponse(html, headers={"Cache-Control": "no-cache"})
+    except Exception as e:
+        return HTMLResponse(f"<body style='font-family:monospace;padding:20px;color:#8A8578'>3D viewer "
+                            f"unavailable for {slug}: {e}</body>", status_code=502)
 
 
 app.mount("/assets", StaticFiles(directory=str(STATIC / "assets")), name="assets")
@@ -418,6 +451,28 @@ def _trace(sid):
 @app.get("/api/kg")
 def _kg():
     return {"nodes": [], "edges": []}
+
+
+@app.post("/api/cad/genesis")
+async def _cad_genesis(payload: dict = None):
+    """CAD → D2M handoff (Phase 6): AgentCAD posts a RELEASED design_id; D2M builds the genesis spec and
+    either previews it (confirm=false — the board's decision card, no SAP writes) or commits it
+    (confirm=true — materials + BOM + routing + PV + PIR/cost, anchored + reconciled + conformance-checked
+    vs the CAD-intended spec), returning the CAD-part# ↔ SAP-material# digital thread. This IS the POST
+    that AgentCAD's emit_to_plm_erp stub deferred."""
+    payload = payload or {}
+    design_id = payload.get("design_id")
+    if not design_id:
+        return JSONResponse({"error": "design_id is required"}, status_code=400)
+    try:
+        from cad_bridge import cad_genesis
+        res = await asyncio.to_thread(cad_genesis, design_id, bool(payload.get("confirm")),
+                                      payload.get("plant"), payload.get("store_root"))
+        return JSONResponse(res)
+    except FileNotFoundError as e:
+        return JSONResponse({"error": str(e)}, status_code=404)
+    except Exception as e:
+        return JSONResponse({"error": f"{type(e).__name__}: {e}"}, status_code=500)
 
 
 @app.post("/api/explain")
@@ -625,6 +680,89 @@ async def ws(websocket: WebSocket, sid: str):
                           "result": str(answer)[:8000]})
             st["pending_bom"] = None
             learn_line = "DETERMINISTIC file-BOM commit (bypassed model spec-rebuild — no flattening)"
+        elif st.get("pending_cad") or cad_design.is_cad_design(text, img is not None):
+            # UNIFIED Ideate→Design→Make→Plan: D2M is the ONE app; a "design a …" prompt (or an in-flight
+            # design gate) is driven here by orchestrating AgentCAD (:5005) as a CAD backend, then D2M's
+            # own genesis + planning. Each stage is a normal D2M turn (pending_cad carries the gate), so
+            # the whole chain persists as ONE D2M session (chat + agent-activity + cards).
+            intent = "cad_design"
+            injected, lessons = False, []
+            mem.add_user(text, img, "image/png" if img else None)   # persist the turn (no run_turn here)
+            _pcad = st.get("pending_cad")
+            _dtext = text
+            if not _pcad:                                # NEW design: a vague reference ("what about the 2d
+                # design?") has no product of its own -> design the subject we've been discussing, not the
+                # literal question. Resolve from the recent user turns (newest first).
+                _recent = [t.get("text", "") for t in mem.session.reload_turns() if t.get("role") == "user"]
+                _dtext = cad_design.resolve_design_intent(text, list(reversed(_recent)))
+            _conductor("🎛 design → make → plan (unified)…"
+                       + (f"  ↪ designing “{_dtext[:52]}”" if _dtext != text else ""))
+
+            def _cad_prog(msg):
+                if msg:
+                    _conductor(msg if len(str(msg)) < 90 else str(msg)[:88] + "…")
+            res = await asyncio.to_thread(cad_design.drive_cad_stage, mem.session, _pcad, _dtext, "1710", _cad_prog)
+            answer = res.get("answer", "")
+            st["pending_cad"] = res.get("pending")
+            _ref = res.get("image_ref")
+            if _ref:                                     # show the 2D/3D inline (markdown) + as a durable chat image
+                _name = _ref.split("/")[-1]
+                answer += f"\n\n![design](/api/sessions/{sid}/asset/{_name})"
+                mem.session.append_trace({"role": "assistant", "text": "[design image]", "image_ref": _ref})
+            for _c in res.get("cards", []):              # Structured-Data cards
+                steps.append({"author": "cad", "kind": "tool_result", "tool": _c["tool"], "result": _c["result"]})
+            for _ev in res.get("chain", []):             # Agent-Activity events
+                _activity(_ev.get("agent", "cad"), _ev.get("kind", "reasoning"),
+                          **{k: v for k, v in _ev.items() if k not in ("agent", "kind")})
+            mem.add_assistant({"content": answer})
+            learn_line = "CAD-DESIGN unified flow · stage=" + str((res.get("pending") or {}).get("stage") or "complete")
+        elif is_completion_question(text) and not img:
+            # VERIFIED COMPLETION (B2): a completion/verification question NEVER gets an agent's answer.
+            # The Guide narrates (no SAP tools -> it cannot verify), the doer is optimistic (it wrote the
+            # claim being checked) -- so this is routed, at dispatch, to the Verifier's MANIFEST
+            # RECONCILIATION: the declared manifest (typed session state) vs a live SAP re-read. The FIRST
+            # answer is the reconciliation, not narration -- the user never has to ask twice. Checked
+            # BEFORE the Guide/genesis/planning branches so their keywords can't hijack the question.
+            intent = "verify"
+            injected, lessons = False, []
+            _anch = session_anchors.read(mem.session.dir)
+            _aspec = session_anchors.spec_of(_anch)
+            if _anch and _aspec:
+                _conductor("🧾 completion question → manifest reconciliation (independent re-read, never narration)…")
+                from conformance import reconcile_manifest as _rman
+                _vplant = _anch.plant or "1710"
+                _scope = list(_anch.created_ledger or [])
+                if _anch.fg_material and _anch.fg_material not in _scope:
+                    _scope.append(_anch.fg_material)
+                _rrep, _rrec = await asyncio.to_thread(_rman, _aspec, _scope, _vplant, _emitter("verifier"))
+                _rbanner = ("✅ COMPLETE — every planned object reconciles against SAP (zero missing)"
+                            if _rrec.get("complete") else
+                            f"⛔ INCOMPLETE — {len(_rrec.get('missing') or [])} of {_rrec.get('planned')} "
+                            f"planned object(s) MISSING in SAP")
+                answer = f"### 🧾 {_rbanner}\n{_rrep}"
+                # per-object completeness (BOM/routing/PV/PIR/cost + plant view) on the same live scope
+                if _scope:
+                    _p2, _m2, _u2, _v2, _vd2 = await asyncio.to_thread(
+                        verify_genesis_objects, _scope, _vplant, _emitter("verifier"))
+                    answer += f"\n\n---\n### 🔍 Object detail (independent read-back)\n{_v2}"
+                    try:
+                        steps.append({"author": "verifier", "kind": "tool_result", "tool": "genesis_verification",
+                                      "result": verification_cards.genesis_card(_vd2)})
+                    except Exception:
+                        pass
+                steps.append({"author": "verifier", "kind": "tool_result", "tool": "reconciliation",
+                              "result": _rrep + "\n@@DATA@@" + json.dumps(_rrec, ensure_ascii=False, default=str)})
+                learn_line = ("VERIFIED-COMPLETION route: manifest reconciliation "
+                              f"({_rrec.get('created')}/{_rrec.get('planned')} planned, "
+                              f"{len(_rrec.get('missing') or [])} missing)")
+            else:
+                # honest no-anchor surface (mirrors the verify-skip guard): with no manifest in THIS
+                # session there is nothing to certify against -- say so, never guess a verdict.
+                answer = ("### 🧾 Nothing to reconcile against\nNo genesis has anchored a manifest in this "
+                          "session, so there is no declared plan to verify completion against. Run (or "
+                          "re-open the session of) the genesis you mean, or name the FERT material and I "
+                          "can verify its live BOM tree object-by-object instead.")
+                learn_line = "VERIFIED-COMPLETION route: no manifest anchored — honest no-verdict"
         elif is_platform_question(text) and not img:
             # THE GUIDE (the "demo lady"): a meta question ABOUT the tool/architecture, not a master-data
             # task -> a read-only Guide agent explains it, briefly and spoken-style. The client speaks the
@@ -701,13 +839,19 @@ async def ws(websocket: WebSocket, sid: str):
         elif is_planning(text):
             # THE PLANNER (Design -> Make -> PLAN): demand + MRP for an ALREADY-MRP-ready material.
             # Scoped to PLANNER_TOOLS -> it structurally CANNOT create/change master data.
+            # SESSION ANCHORS (A): FG material + plant are read DETERMINISTICALLY from typed state and
+            # pinned into the persona -- after a genesis, "create demand for the FG and run MRP" must
+            # never re-ask for them (an anchor present but re-asked is a bug; absent -> asking is right).
             intent = "planning"
-            mem.system = PLANNER_PERSONA
+            _anch = session_anchors.read(mem.session.dir)
+            mem.system = PLANNER_PERSONA + session_anchors.planner_block(_anch)
             injected, lessons = False, []
             _status("📅 planner…")
             answer = await asyncio.to_thread(run_turn, mem, text, img, "image/png", True, CHAT_MAX_STEPS,
                                              False, steps, allowed_tools=PLANNER_TOOLS, on_step=_emitter("planner"), agent_label="planner")
-            learn_line = "PLANNER mode: demand + MRP (scoped — no master-data writes)"
+            learn_line = ("PLANNER mode: demand + MRP (scoped — no master-data writes)"
+                          + (f" · anchors: FG {_anch.fg_material} @ {_anch.plant}"
+                             if _anch and _anch.fg_material else " · anchors: none"))
         else:
             intent = _classify(text)
             learn.capture_correction(st["prev_intent"], text, st["last_answer"])        # capture
@@ -726,6 +870,10 @@ async def ws(websocket: WebSocket, sid: str):
         # false-complete + half-finished genesis in sessions 903d6806 / 67664336. Default off.
         anchor = _created_materials(steps)
         planned = _planned_material(steps)
+        # the verification plant comes from the SESSION ANCHORS (the plant this genesis actually used),
+        # not a hardcoded literal; "1710" stays only as the no-anchor fallback.
+        _anch_state = session_anchors.read(mem.session.dir)
+        _vplant = (_anch_state.plant if _anch_state and _anch_state.plant else "1710")
         if ORCHESTRATE_ON and planned:
             # PLANNING WRITE -> the recursive MRP-TREE validator (the Plan-Verifier). A committed run_mrp
             # produces no created materials, so the master-data verifier can't anchor -- but the MRP RESULT
@@ -765,7 +913,7 @@ async def ws(websocket: WebSocket, sid: str):
             # leaves anchor empty and never trips this.
             _verifier_emit = _emitter("verifier")
             _conductor(f"🔍 verifying {len(anchor)} material(s) against SAP (deterministic, ~0 tokens)…")
-            passed, missing, unverified, verdict, vdata = await asyncio.to_thread(verify_genesis_objects, anchor, "1710", _verifier_emit)
+            passed, missing, unverified, verdict, vdata = await asyncio.to_thread(verify_genesis_objects, anchor, _vplant, _verifier_emit)
             heals, steer_notes, dropped, stopped = 0, [], set(), False
             while (not passed) and missing > 0 and heals < HEAL_MAX:
                 notes, stop = await _drain_steer()   # /btw guidance the user typed mid-run
@@ -788,7 +936,7 @@ async def ws(websocket: WebSocket, sid: str):
                 steps.extend(hs)
                 anchor = [a for a in _created_materials(steps) if a not in dropped]   # newly-created join; dropped phantoms leave
                 _conductor(f"🔍 re-verifying against SAP (after heal {heals}, deterministic)…")
-                passed, missing, unverified, verdict, vdata = await asyncio.to_thread(verify_genesis_objects, anchor, "1710", _verifier_emit)
+                passed, missing, unverified, verdict, vdata = await asyncio.to_thread(verify_genesis_objects, anchor, _vplant, _verifier_emit)
             if stopped:
                 banner = (f"⏹ Healing STOPPED on your request after {heals} pass(es). "
                           f"{missing} object(s) were still MISSING when you stopped.")
@@ -807,30 +955,64 @@ async def ws(websocket: WebSocket, sid: str):
                               "result": verification_cards.genesis_card(vdata)})
             except Exception:
                 pass                                  # a card render must never break the turn
-            # CONFORMANCE AUDIT: presence+heal ensured existence; now diff ACTUAL SAP vs the INTENDED contract
-            # (the spec) field-by-field. This is real verification -- it catches DRIFT presence can't (a routing
-            # that exists but fell back to a default work center). File-driven only (needs the spec). ~0 tokens.
+            # LEDGER: fold every material the verifier actually confirmed into the typed created ledger
+            # (heals included), so later reconciliations/questions read the same state.
+            try:
+                session_anchors.add_created(mem.session.dir,
+                                            [r["mat"] for r in (vdata or {}).get("rows", [])] or anchor)
+            except Exception:
+                pass
+            # CONFORMANCE + MANIFEST RECONCILIATION: presence+heal ensured existence of what was CREATED;
+            # now audit ACTUAL SAP vs the INTENDED contract -- automatically, for EVERY genesis. The spec
+            # comes from the committed BOM file when there is one, else from the SESSION ANCHORS (the
+            # spec anchored at preview/commit -- this is what makes IMAGE genesis reconcile too, instead
+            # of the created-anchored false-green). The reconciliation is the SOLE source of "complete":
+            # a created-set verify can never see the 13 objects that were never created; the manifest can.
+            _cspec, _csrc = None, ""
             _cpath = _committed_bom_path(steps)
             if _cpath:
-                _conductor("🧾 conformance audit — actual SAP state vs the approved plan…")
                 try:
                     from excel_bom import genesis_from_excel as _cgfe
-                    from conformance import verify_conformance as _vconf
-                    from plan_card import conformance_card as _ccard
                     _cp = _cpath if os.path.exists(_cpath) else os.path.join(
                         os.path.dirname(os.path.abspath(__file__)), "mcp_server", _cpath)
                     _cspec, _ = await asyncio.to_thread(_cgfe, _cp if os.path.exists(_cp) else _cpath)
+                    _csrc = f"BOM file {os.path.basename(_cpath)}"
+                except Exception:
+                    _cspec = None
+            if _cspec is None:
+                _anch_state = session_anchors.read(mem.session.dir)   # re-read: the commit just anchored it
+                _cspec = session_anchors.spec_of(_anch_state)
+                _csrc = "session-anchored manifest"
+            if _cspec is not None:
+                _conductor(f"🧾 conformance + manifest reconciliation — actual SAP vs the approved plan ({_csrc})…")
+                try:
+                    from conformance import verify_conformance as _vconf
+                    from plan_card import conformance_card as _ccard
                     _cok, _cdiffs, _crep, _cdata = await asyncio.to_thread(
-                        _vconf, _cspec, anchor, "1710", _emitter("verifier"))
-                    _cbanner = ("✅ CONFORMS — SAP state matches the approved plan" if _cok else
-                                f"❌ {_cdata['diffs']} field(s) DO NOT conform to the plan "
-                                f"(drift/missing presence can't see — see the Conformance card)")
+                        _vconf, _cspec, anchor, _vplant, _emitter("verifier"))
+                    _crec = _cdata.get("reconciliation") or {}
+                    if _crec and not _crec.get("complete", True):
+                        _cbanner = (f"⛔ INCOMPLETE vs the manifest — {len(_crec.get('missing') or [])} of "
+                                    f"{_crec.get('planned')} planned object(s) were NEVER CREATED. "
+                                    f"Any 'complete' above is void.")
+                    elif _cok:
+                        _cbanner = "✅ COMPLETE & CONFORMS — every planned object created; SAP state matches the approved plan"
+                    else:
+                        _cbanner = (f"❌ {_cdata['diffs']} field(s) DO NOT conform to the plan "
+                                    f"(drift/missing presence can't see — see the Conformance card)")
                     answer = f"{answer}\n\n---\n### 🧾 {_cbanner}\n{_crep}"
-                    learn_line += f" · [conformance] {'PASS' if _cok else str(_cdata['diffs'])+' diff'}"
+                    learn_line += (f" · [reconcile] {_crec.get('created', '?')}/{_crec.get('planned', '?')}"
+                                   f" · [conformance] {'PASS' if _cok else str(_cdata['diffs'])+' diff'}")
                     steps.append({"author": "verifier", "kind": "tool_result", "tool": "conformance",
                                   "result": _ccard(_cdata)})
                 except Exception as _ce:
                     answer = f"{answer}\n\n---\n### ⚠️ Conformance audit errored ({type(_ce).__name__}: {_ce})"
+            else:
+                _conductor("⚠️ no manifest to reconcile against (no anchored spec, no BOM file) — completion NOT certified")
+                answer = (f"{answer}\n\n---\n### ⚠️ Completion not certified\nObjects that were created "
+                          f"verified against SAP, but no manifest is anchored for this genesis, so "
+                          f"created-vs-planned reconciliation could not run — a silent under-delivery "
+                          f"would be invisible. Re-run the genesis through its preview so the manifest anchors.")
 
         st["last_answer"], st["prev_intent"] = answer, intent
         _prev = _bom_preview_call(steps)              # a BOM-file PREVIEW this turn -> remember it so the next

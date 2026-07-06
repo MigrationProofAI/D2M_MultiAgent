@@ -68,7 +68,7 @@ def _descmap(anchor):
     with concurrent.futures.ThreadPoolExecutor(max_workers=_WORKERS) as pool:
         for m, d in pool.map(lambda x: (str(x), _desc(x)), anchor):
             if d:
-                out.setdefault(d.strip().lower(), m)
+                out.setdefault(_normdesc(d), m)
     return out
 
 
@@ -92,10 +92,81 @@ def _walk(spec):
     return nodes
 
 
+def _normdesc(s):
+    """Normalise a description for spec-node -> created-material matching. Creates truncate the
+    description to 40 chars (genesis _create_material), so the spec side must truncate the same way
+    or a long-named planned node would false-flag as missing."""
+    return str(s or "")[:40].strip().lower()
+
+
+def _reconcile(nodes, descmap, anchor):
+    """The typed ReconciliationReport{planned, created, missing, extra, verdict} -- the ONLY shape a
+    completion claim may come from. planned = the manifest's node set; missing = planned nodes with NO
+    created material behind them; extra = created materials no planned node accounts for."""
+    dm = {_normdesc(k): v for k, v in (descmap or {}).items()}
+    missing, matched = [], set()
+    for e in nodes:
+        n = e["node"]
+        key = _normdesc(n.get("description") or n.get("name"))
+        mat = dm.get(key)
+        if mat:
+            matched.add(str(mat))
+        else:
+            missing.append(str(n.get("description") or n.get("name") or "?").strip())
+    extra = sorted(set(str(a) for a in (anchor or [])) - matched,
+                   key=lambda x: int(x) if str(x).isdigit() else 0)
+    planned = len(nodes)
+    created = planned - len(missing)
+    verdict = ("COMPLETE — zero missing" if not missing
+               else f"INCOMPLETE — {len(missing)} of {planned} planned object(s) MISSING")
+    return {"kind": "ReconciliationReport", "planned": planned, "created": created,
+            "missing": missing, "extra": extra, "verdict": verdict, "complete": not missing}
+
+
+def _recon_report(recon):
+    lines = [f"MANIFEST RECONCILIATION — {recon['planned']} planned · {recon['created']} created · "
+             f"{len(recon['missing'])} missing · {len(recon['extra'])} extra"]
+    if recon["missing"]:
+        lines.append(f"MISSING ({len(recon['missing'])}) — planned but NOT created:")
+        lines += [f"  MISSING {m}" for m in recon["missing"][:40]]
+        if len(recon["missing"]) > 40:
+            lines.append(f"  … +{len(recon['missing']) - 40} more")
+    if recon["extra"]:
+        lines.append(f"EXTRA ({len(recon['extra'])}) — created but not in the manifest: "
+                     + ", ".join(recon["extra"][:12]) + (" …" if len(recon["extra"]) > 12 else ""))
+    lines.append("VERDICT: " + recon["verdict"])
+    return "\n".join(lines)
+
+
+def reconcile_manifest(spec, anchor, plant="1710", on_step=None):
+    """MANIFEST RECONCILIATION (deterministic, ~0 tokens) -- reconcile what was DECLARED (the genesis
+    spec/manifest) against what actually EXISTS in SAP (the created ledger + a live BOM-tree re-read).
+    THIS is the sole source of any 'complete' statement: no agent may say complete except by surfacing
+    this report with zero missing. Returns (report_text, recon_dict)."""
+    def emit(msg):
+        if on_step:
+            try:
+                on_step({"kind": "reasoning", "text": msg})
+            except Exception:
+                pass
+
+    anchor = [str(a) for a in (anchor or [])]
+    n0 = len(anchor)
+    anchor = _expand_tree(anchor, plant)              # live re-read: the ACTUAL created tree, not the claim
+    if len(anchor) != n0:
+        emit(f"scope widened via live BOM tree: {n0} → {len(anchor)} materials")
+    emit(f"manifest reconciliation: mapping {len(anchor)} created materials against the manifest…")
+    descmap = _descmap(anchor)
+    nodes = _walk(spec)
+    recon = _reconcile(nodes, descmap, anchor)
+    recon["plant"] = plant
+    return _recon_report(recon), recon
+
+
 def _check_node(entry, plant, descmap):
     """Diff ONE node's created objects against its intended contract. Returns list of findings."""
     n = entry["node"]
-    key = str(n.get("description") or n.get("name") or "").strip().lower()
+    key = _normdesc(n.get("description") or n.get("name"))
     mat = descmap.get(key)
     if not mat:
         return [{"node": key, "mat": None, "object": "material", "field": "exists",
@@ -127,7 +198,7 @@ def _check_node(entry, plant, descmap):
         kids = n.get("components") or []
         intended = {}
         for c in kids:
-            cm = descmap.get(str(c.get("description") or c.get("name") or "").strip().lower())
+            cm = descmap.get(_normdesc(c.get("description") or c.get("name")))
             if cm:
                 intended[cm] = _num(c.get("quantity", 1))
         actual = {}
@@ -196,6 +267,8 @@ def verify_conformance(spec, anchor, plant="1710", on_step=None):
     emit(f"conformance audit: mapping {len(anchor)} created materials…")
     descmap = _descmap(anchor)
     nodes = _walk(spec)
+    recon = _reconcile(nodes, descmap, anchor)        # typed ReconciliationReport: planned vs created
+    recon["plant"] = plant
     emit(f"diffing {len(nodes)} nodes against the intended contract…")
     findings = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=_WORKERS) as pool:
@@ -212,7 +285,8 @@ def verify_conformance(spec, anchor, plant="1710", on_step=None):
         if not x["conforms"]:
             by_obj[o][1] += 1
 
-    lines = [f"CONFORMANCE AUDIT (actual SAP state vs intended contract) — {len(nodes)} nodes, {checked} field checks",
+    lines = [_recon_report(recon), "",
+             f"CONFORMANCE AUDIT (actual SAP state vs intended contract) — {len(nodes)} nodes, {checked} field checks",
              "  " + " · ".join(f"{o}: {t - d}/{t} conform" + (f" ({d} DIFF)" if d else "") for o, (t, d) in by_obj.items())]
     if diffs:
         lines.append(f"\nNON-CONFORMING ({len(diffs)}):")
@@ -224,7 +298,8 @@ def verify_conformance(spec, anchor, plant="1710", on_step=None):
     lines.append("\nVERDICT: " + ("CONFORMS — SAP state matches the approved plan ✓"
                                   if passed else f"{len(diffs)} field(s) DO NOT conform to the plan"))
     data = {"kind": "conformance", "plant": plant, "nodes": len(nodes), "checks": checked,
-            "diffs": len(diffs), "passed": passed, "by_object": by_obj, "findings": findings}
+            "diffs": len(diffs), "passed": passed, "by_object": by_obj, "findings": findings,
+            "reconciliation": recon}
     return passed, diffs, "\n".join(lines), data
 
 
@@ -246,7 +321,7 @@ def reconcile_routings(spec, anchor, plant="1710", on_step=None):
 
     def _one(entry):
         n = entry["node"]
-        key = str(n.get("description") or n.get("name") or "").strip().lower()
+        key = _normdesc(n.get("description") or n.get("name"))
         mat = descmap.get(key)
         ops = n.get("routing") or [{"work_center": "ASSEMBLY"}, {"work_center": "PACK01"}]
         planned = [o.get("work_center") for o in ops]

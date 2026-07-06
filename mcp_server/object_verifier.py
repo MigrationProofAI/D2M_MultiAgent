@@ -33,6 +33,26 @@ def _mtype(m):
         return None
 
 
+def _head_and_plant(m, plant):
+    """(ProductType, plant_view_status) in ONE read: header + to_Plant $expanded, filtered to `plant`.
+    B3: a created material MUST carry its plant view ('born routable') -- a MARA-basic-only material is
+    a real gap the presence verifier previously could not see (the plant-extension regression). Status:
+    'ok' (a to_Plant row for this plant) | 'missing' (expand read fine, no row) | 'unread' (transient)."""
+    for _ in range(3):
+        try:
+            d = json.loads(get_material(m, segments=["plant"], plant=plant)).get("d", {})
+        except Exception:
+            continue
+        t = d.get("ProductType")
+        if not t:
+            continue
+        pv = d.get("to_Plant")
+        if isinstance(pv, dict) and isinstance(pv.get("results"), list):
+            return t, ("ok" if pv["results"] else "missing")
+        return t, "unread"
+    return None, "unread"
+
+
 def _bom_children(m, plant):
     """Component material numbers of m's BOM (from get_bom's @@DATA@@ payload), or [] if none/unreadable."""
     try:
@@ -145,16 +165,19 @@ def _cost_ok(m):
 
 def _check_material(m, plant):
     """Certify ONE material's objects. Pure read, no shared state -> safe to run in a worker thread.
-    Returns (mat, type_or_None, [missing...], [unverified...], detail) where detail names each object's id."""
-    t = _mtype(m)
+    Returns (mat, type_or_None, [missing...], [unverified...], detail) where detail names each object's id.
+    EVERY material is also checked for its PLANT VIEW (B3): basic-view-only = MISSING, heal-able via
+    extend_to_plant -- the same read that confirms the type, so no extra call."""
+    t, pview = _head_and_plant(m, plant)
     if not t:
         return m, None, [f"{m} material"], [], {}   # could not confirm the material exists at all
     miss, unv, detail = [], [], {}
+    checks = [("plant view", (pview, plant if pview == "ok" else None))]
     if t in ("FERT", "HALB"):
-        checks = (("BOM", _bom_ok(m, plant)), ("routing", _routing_ok(m, plant)),
-                  ("production version", _pv_ok(m, plant)))
+        checks += [("BOM", _bom_ok(m, plant)), ("routing", _routing_ok(m, plant)),
+                   ("production version", _pv_ok(m, plant))]
     else:
-        checks = (("PIR", _pir_ok(m)), ("cost condition", _cost_ok(m)))
+        checks += [("PIR", _pir_ok(m)), ("cost condition", _cost_ok(m))]
     for obj, (st, ident) in checks:
         detail[obj] = {"status": st, "id": ident}
         if st == "missing":
@@ -225,14 +248,15 @@ def verify_genesis_objects(anchor, plant="1710", on_step=None, expand=True):
              f"({made_n} made, {bought_n} bought)",
              f"materials confirmed : {confirmed_mats}/{len(anchor)}",
              "",
-             f"{'material':>8}  {'type':<5} {'BOM/PIR':<12} {'routing/cost':<13} {'prod.ver':<9}"]
+             f"{'material':>8}  {'type':<5} {'plant':<9} {'BOM/PIR':<12} {'routing/cost':<13} {'prod.ver':<9}"]
     for r in rows:                                       # DETAIL: name every object id per material
         o = r["objects"]
+        cp = _cell(o.get("plant view"))
         if r["type"] in ("FERT", "HALB"):
             c1, c2, c3 = _cell(o.get("BOM")), _cell(o.get("routing")), _cell(o.get("production version"))
         else:
             c1, c2, c3 = _cell(o.get("PIR")), _cell(o.get("cost condition")), ""
-        lines.append(f"{r['mat']:>8}  {r['type']:<5} {c1:<12} {c2:<13} {c3:<9}")
+        lines.append(f"{r['mat']:>8}  {r['type']:<5} {cp:<9} {c1:<12} {c2:<13} {c3:<9}")
     if unverified:
         lines.append("")
         lines.append(f"UNVERIFIED ({len(unverified)}) — read failed after retries, NOT a gap: "

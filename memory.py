@@ -81,6 +81,16 @@ class TieredMemory:
         msgs = []
         if self.system:
             msgs.append({"role": "system", "content": self.system})
+        # SESSION ANCHORS ride PINNED (typed state from anchors.json, not recollection): the durable
+        # facts -- FG material, plant, manifest/ledger counts -- survive compaction because they are
+        # re-read from disk every context build, never summarised away.
+        try:
+            import anchors as _anchors
+            pin = _anchors.pinned(self.session.dir)
+            if pin:
+                msgs.append({"role": "system", "content": pin})
+        except Exception:
+            pass
         if self.summary:
             msgs.append({"role": "system", "content": "SUMMARY of earlier turns (compacted, facts preserved):\n" + self.summary})
         return msgs + self.working
